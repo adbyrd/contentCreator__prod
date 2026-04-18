@@ -1,1 +1,1 @@
-# Content-Creator-Production-
+![Content Creator](/assets/images/github-header.jpg)
