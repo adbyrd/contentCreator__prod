@@ -1,18 +1,144 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+###############################################################################
+# The Content Creator
+# The authoritative .gitignore for the CC monorepo. 
+# Prevents credential leaks, environment drift, and non-deterministic artifacts from ever entering Git history. 
+###############################################################################
+###############################################################################
+# OS / Editor Noise
+###############################################################################
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+*.bak
+.idea/
+.vscode/
+*.code-workspace
 
-# Other files and folders
-.settings/
+###############################################################################
+# Node.js / JavaScript
+###############################################################################
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dist/
+build/
+.cache/
+.eslintcache
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+###############################################################################
+# Environment & Secrets (ABSOLUTE BLOCK)
+###############################################################################
+.env
+.env.*
+!.env.example
+*.env.local
+*.secret
+*.secrets
+*.key
+*.pem
+*.crt
+*.p12
+*.der
+*.jks
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+###############################################################################
+# Vendor Credentials / Tokens
+###############################################################################
+**/hubspot.env
+**/postmark.env
+**/openai.env
+**/wix.env
+**/skool.env
+**/n8n.env
+
+###############################################################################
+# n8n Runtime Artifacts
+###############################################################################
+.n8n/
+n8n/
+**/.n8n/
+**/n8n_data/
+**/n8n_backup/
+**/n8n.sqlite
+**/database.sqlite
+**/workflow_backups/
+**/*_execution.json
+
+###############################################################################
+# n8n Exports (Only versioned exports allowed)
+###############################################################################
+**/workflows/n8n/export/*.tmp
+**/workflows/n8n/export/*.bak
+
+###############################################################################
+# Logs & Telemetry
+###############################################################################
+logs/
+*.log
+coverage/
+*.lcov
+reports/
+telemetry/
+metrics/
+
+###############################################################################
+# Test Artifacts
+###############################################################################
+test-results/
+playwright-report/
+junit.xml
+*.snap.new
+
+###############################################################################
+# Postman / API Tooling
+###############################################################################
+.postman/
+.postman-workspace/
+postman.env.json
+postman.env.*.json
+!postman.env.example.json
+
+###############################################################################
+# Build / Packaging
+###############################################################################
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+###############################################################################
+# PDFs – Generated Only (Canonical PDFs must be explicit)
+###############################################################################
+**/generated/
+**/exports/
+**/*.pdf.tmp
+
+###############################################################################
+# Temporary Scripts / One-offs
+###############################################################################
+scratch/
+tmp/
+_temp/
+scripts/local/
+scripts/debug/
+
+###############################################################################
+# CI / Local Overrides
+###############################################################################
+.override/
+overrides/
+local.config.*
+ci.local.yml
+
+###############################################################################
+# Security: Explicitly Forbidden
+###############################################################################
+**/*token*
+**/*apikey*
+**/*auth*
+**/*credential*
