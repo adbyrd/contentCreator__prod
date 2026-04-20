@@ -1,30 +1,36 @@
 /**
  * Utility: Notifications & User Feedback
  * Path: /public/utils/notification.js
- * Version: [ NOTIFICATIONS : v.2.1.0 ]
+ * Version: [ NOTIFICATIONS : v.2.2.0 ]
  *
- * v.2.1.0 — Master Page Toaster Fix
- * ────────────────────────────────────
- * ISSUE: showToaster() used $w('#globalToaster') directly. In Velo, $w()
- * is page-scoped. When this utility is called from a page controller or
- * another public utility, $w() resolves against that page's element tree —
- * NOT the Master Page canvas. #globalToaster and #toasterMsg live on the
- * Master Page and are therefore unreachable, producing the warning:
- *   "showToaster: #globalToaster not found on this page."
+ * v.2.2.0 — postMessage Toaster Bridge
+ * ──────────────────────────────────────
+ * PROBLEM: Both the direct $w('#globalToaster') approach (v.2.0.0) and the
+ * exported function approach (v.2.1.0 / triggerGlobalToaster) produce
+ * "#globalToaster not found" because Velo always binds $w() to the calling
+ * module's runtime scope, not where the function was defined. Exporting a
+ * function from masterPage.js does not transfer its $w scope to callers.
  *
- * FIX: All $w() access for the global toaster is now delegated to
- * `triggerGlobalToaster()` exported from masterPage.js. Because that
- * function executes within the Master Page module scope, its $w() calls
- * resolve correctly against the Master Page canvas at runtime.
+ * SOLUTION: Use wixWindow.postMessage() to send a structured message to the
+ * Master Page. masterPage.js listens via wixWindow.onMessage() and calls its
+ * own _showToaster() which runs entirely in the Master Page scope, where
+ * $w('#globalToaster') resolves correctly.
  *
- * showInlineError() and clearInlineError() are unaffected — they operate
- * on page-local elements and their $w() calls are intentionally page-scoped.
+ * Message contract:
+ *   { channel: 'SHOW_TOASTER', message: string, type: 'success' | 'error' }
  *
- * Existing export signatures are fully backward compatible.
+ * This is the only Velo-supported mechanism for cross-scope Master Page
+ * DOM operations from page code or public utilities.
+ *
+ * All existing showToaster() call sites are unchanged — the public API is
+ * backward compatible. No other files require modification.
+ *
+ * showInlineError() and clearInlineError() are unchanged — they operate on
+ * page-local elements where page-scoped $w() is correct.
  *
  * Canvas requirements:
- *   Master Page: #globalToaster, #toasterMsg  (managed by masterPage.js)
- *   Page-local:  per-selector inline error elements (managed by callers)
+ *   Master Page : #globalToaster, #toasterMsg  (managed by masterPage.js)
+ *   Page-local  : per-selector inline error elements (managed by callers)
  *
  * Exports:
  *   showToaster(message, type)
@@ -33,9 +39,10 @@
  *   debugNotifications()
  */
 
-import { triggerGlobalToaster } from 'public/pages/masterPage';
+import wixWindow from 'wix-window';
 
-const VERSION = '[ NOTIFICATIONS : v.2.1.0 ]';
+const VERSION            = '[ NOTIFICATIONS : v.2.2.0 ]';
+const TOASTER_CHANNEL    = 'SHOW_TOASTER';
 
 // ─── SHARED CONSTANTS ─────────────────────────────────────────────────────────
 
@@ -51,22 +58,21 @@ const INLINE_ERROR_DURATION_MS = 6000;
 /**
  * Displays the site-wide feedback bar on the Master Page.
  *
- * Delegates to triggerGlobalToaster() in masterPage.js so that the
- * $w('#globalToaster') call executes in the Master Page scope, where
- * the element actually exists.
+ * Sends a postMessage to the Master Page, which runs _showToaster() in its
+ * own scope where $w('#globalToaster') resolves correctly.
  *
- * Safe to call from page controllers, modals, and utilities.
+ * Safe to call from page controllers, modals, and utilities on any page.
  *
  * @param {string} message
  * @param {'success'|'error'} [type='success']
  */
 export function showToaster(message, type = 'success') {
     try {
-        triggerGlobalToaster(message, type);
+        wixWindow.postMessage({ channel: TOASTER_CHANNEL, message, type });
+        console.log(`${VERSION} [${type.toUpperCase()}] showToaster dispatched: "${message}"`);
     } catch (err) {
-        // Defensive fallback — log and do not throw so callers are never
-        // interrupted by a notification failure.
-        console.warn(`${VERSION} showToaster: triggerGlobalToaster failed. Message was: "${message}"`, err);
+        // postMessage failure must never interrupt the calling flow.
+        console.warn(`${VERSION} showToaster: postMessage failed. Message was: "${message}"`, err);
     }
 }
 
@@ -77,8 +83,8 @@ export function showToaster(message, type = 'success') {
  * it after a timeout.
  *
  * These elements are page-local — $w() is correctly page-scoped here.
- * Falls back to the global toaster if the element is not found, so the
- * message is never silently dropped.
+ * Falls back to showToaster() if the element is not present so the message
+ * is never silently dropped.
  *
  * @param {string} selector    - e.g. '#newProjectError'
  * @param {string} message

@@ -1,71 +1,92 @@
 /**
  * Page Code: Master Page (Global)
  * Path: /page_code/global/masterPage.js
- * Version: [ MASTER PAGE : v.1.4.0 ]
+ * Version: [ MASTER PAGE : v.1.5.0 ]
  *
- * v.1.4.0 — Global Toaster Bridge
- * ─────────────────────────────────
- * ISSUE: showToaster() in notification.js calls $w('#globalToaster') from
- * a /public/utils/ module. In Velo, $w() is page-scoped — public utilities
- * run in the calling page's context, not the Master Page's context. Elements
- * that belong to the Master Page canvas (#globalToaster, #toasterMsg) are
- * therefore unreachable via $w() from any utility or page controller.
+ * v.1.5.0 — Cross-Scope Toaster via postMessage
+ * ───────────────────────────────────────────────
+ * PROBLEM: Velo's $w() is always bound to the scope of the module that
+ * calls it at runtime, not the module where the function is defined.
+ * Exporting a function from masterPage.js and calling it from a public
+ * utility or page controller does NOT transfer the Master Page's $w scope
+ * to that call — $w still resolves against the calling page's DOM, where
+ * #globalToaster does not exist.
  *
- * FIX: The Master Page owns and controls its own elements exclusively.
- * It exposes a module-level function `triggerGlobalToaster(message, type)`
- * that notification.js imports and calls. Because this export lives in
- * masterPage.js, $w() inside it resolves correctly against the Master Page
- * canvas at runtime.
+ * SOLUTION: The Master Page owns its own elements exclusively and listens
+ * for toaster requests via wixWindow.onMessage(). Page code and utilities
+ * send requests via wixWindow.postMessage(). This is the only Velo-supported
+ * pattern for cross-scope DOM operations targeting Master Page elements.
  *
- * notification.js updated to import and delegate to this function.
+ * Message contract (channel: 'SHOW_TOASTER'):
+ *   Sender  → wixWindow.postMessage({ channel: 'SHOW_TOASTER', message, type })
+ *   Receiver → masterPage.js onMessage handler calls _showToaster(message, type)
  *
- * Canvas requirements (unchanged):
- *   #globalToaster  — collapsible container (Box or Strip) on the Master Page
+ * notification.js is updated to use postMessage instead of $w() directly
+ * or via an exported function. No other files need changes.
+ *
+ * v.1.4.0 changes preserved:
+ *   - triggerGlobalToaster export REMOVED (did not work — see above)
+ *   - Logout uses _showToaster() directly (same scope, works correctly)
+ *
+ * Canvas requirements (Master Page):
+ *   #globalToaster  — collapsible container (Box or Strip)
  *   #toasterMsg     — Text element inside #globalToaster
  *   #btnLogOut      — Logout button
  */
 
 import wixLocation        from 'wix-location';
+import wixWindow          from 'wix-window';
 import { authentication } from 'wix-members';
 
-const VERSION              = '[ MASTER PAGE : v.1.4.0 ]';
-const MSG_ERROR_GENERIC    = 'Technical error encountered. Please try again later.';
-const PATH_HOME            = 'https://www.adbyrd.com/cc';
-const TOASTER_DURATION_MS  = 4000;
+const VERSION             = '[ MASTER PAGE : v.1.5.0 ]';
+const MSG_ERROR_GENERIC   = 'Technical error encountered. Please try again later.';
+const PATH_HOME           = 'https://www.adbyrd.com/cc';
+const TOASTER_DURATION_MS = 4000;
+const TOASTER_CHANNEL     = 'SHOW_TOASTER';
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 
 $w.onReady(function () {
     console.log(`${VERSION} Global Master Page Initialized.`);
 
+    // ── Listen for cross-scope toaster requests from page code / utilities ───
+    // This is the only Velo-supported way for page-scoped code to trigger
+    // an element that lives on the Master Page canvas.
+    wixWindow.onMessage((event) => {
+        const { channel, message, type } = event.data || {};
+        if (channel === TOASTER_CHANNEL && message) {
+            console.log(`${VERSION} onMessage received — channel: ${TOASTER_CHANNEL}`);
+            _showToaster(message, type || 'success');
+        }
+    });
+
+    // ── Wire logout button ───────────────────────────────────────────────────
     $w('#btnLogOut').onClick(async () => {
-        await handleLogOut();
+        await _handleLogOut();
     });
 });
 
-// ─── GLOBAL TOASTER (exported — called by notification.js) ────────────────────
+// ─── TOASTER (Master Page scope — $w resolves correctly here) ─────────────────
 
 /**
- * Displays the site-wide feedback bar.
- *
- * This function MUST live in masterPage.js so that $w() resolves against
- * the Master Page element tree. It is exported so notification.js can
- * delegate to it from any page context.
+ * Shows the global toaster. MUST be called only from within masterPage.js
+ * so that $w() resolves against the Master Page canvas.
+ * External callers must use wixWindow.postMessage({ channel: 'SHOW_TOASTER', ... }).
  *
  * @param {string} message
  * @param {'success'|'error'} [type='success']
  */
-export function triggerGlobalToaster(message, type = 'success') {
+function _showToaster(message, type = 'success') {
     const $toaster = $w('#globalToaster');
     const $text    = $w('#toasterMsg');
 
     if (typeof $toaster?.expand !== 'function') {
-        console.warn(`${VERSION} triggerGlobalToaster: #globalToaster not found on Master Page canvas.`);
+        console.warn(`${VERSION} _showToaster: #globalToaster not found on Master Page canvas.`);
         return;
     }
 
     if (typeof $text?.text === 'undefined') {
-        console.warn(`${VERSION} triggerGlobalToaster: #toasterMsg not found on Master Page canvas.`);
+        console.warn(`${VERSION} _showToaster: #toasterMsg not found on Master Page canvas.`);
         return;
     }
 
@@ -77,15 +98,15 @@ export function triggerGlobalToaster(message, type = 'success') {
 
     $toaster.expand()
         .then(() => setTimeout(() => $toaster.collapse(), TOASTER_DURATION_MS))
-        .catch(err => console.warn(`${VERSION} triggerGlobalToaster expand/collapse error:`, err));
+        .catch(err => console.warn(`${VERSION} _showToaster expand/collapse error:`, err));
 
     console.log(`${VERSION} [${type.toUpperCase()}] ${message}`);
 }
 
 // ─── LOGOUT ───────────────────────────────────────────────────────────────────
 
-async function handleLogOut() {
-    safeDisable('#btnLogOut', true);
+async function _handleLogOut() {
+    _safeDisable('#btnLogOut', true);
     console.log(`${VERSION} Logout initiated.`);
 
     try {
@@ -94,18 +115,18 @@ async function handleLogOut() {
         wixLocation.to(PATH_HOME);
     } catch (err) {
         console.error(`${VERSION} Logout failed:`, err);
-        safeDisable('#btnLogOut', false);
-        triggerGlobalToaster(MSG_ERROR_GENERIC, 'error');
+        _safeDisable('#btnLogOut', false);
+        _showToaster(MSG_ERROR_GENERIC, 'error');
     }
 }
 
 // ─── SAFE UI HELPERS ──────────────────────────────────────────────────────────
 
-function safeDisable(selector, disabled = true) {
+function _safeDisable(selector, disabled = true) {
     const el = $w(selector);
     if (el && typeof el.disable === 'function') {
         disabled ? el.disable() : el.enable();
     } else {
-        console.warn(`${VERSION} safeDisable: Element ${selector} not found.`);
+        console.warn(`${VERSION} _safeDisable: Element ${selector} not found.`);
     }
 }

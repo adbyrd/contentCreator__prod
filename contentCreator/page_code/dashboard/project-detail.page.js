@@ -1,30 +1,41 @@
 /**
  * Page: Project Detail (Dynamic)
  * Path: /page_code/dashboard/project-detail.page.js
- * Version: [ PROJECT DETAIL : v.2.3.0 ]
+ * Version: [ PROJECT DETAIL : v.2.4.0 ]
  *
- * v.2.3.0 — Poller Call Signature Fix
- * ──────────────────────────────────────
- * ISSUE: startStoryboardPolling() was being called with a single object
- * argument: startStoryboardPolling({ projectId, onFrame, ... }).
- * storyboard-poller.js v.2.0.0 expects a positional signature:
- *   startStoryboardPolling(projectId, { onFrame, onComplete, onTimeout, onError })
- * With the old call form, the poller received the entire config object as
- * `projectId` — a truthy non-string value — and passed it to
- * getStoryboardFrames(), which returned a terminal error on the first tick,
- * immediately firing onError() and surfacing "Unable to start generation."
+ * v.2.4.0 — ALREADY_RUNNING handling + DISPATCH_FAILED error routing
+ * ────────────────────────────────────────────────────────────────────
+ * ISSUE A — DISPATCH_FAILED treated the same as all other errors.
+ *   The previous version treated every !result.ok response with a single
+ *   generic showToaster(MSG_GENERATION_FAILED). This meant ALREADY_RUNNING
+ *   (which should resume the active poller) and DISPATCH_FAILED (a real
+ *   infrastructure failure) produced the same UX — both blocked the user.
  *
- * FIX: startPolling() now uses the correct positional signature.
+ * FIX: wireGenerateButton() now routes each error type explicitly:
+ *   ALREADY_RUNNING  → resume polling (attach to the in-progress run)
+ *   DISPATCH_FAILED  → user-safe message + button restored for retry
+ *   CONFIG_ERROR     → user-safe message + button restored for retry
+ *   All others       → generic fallback message + button restored
  *
- * v.2.2.0 changes (preserved):
- *   - Import paths corrected to backend/services/project.web
- *   - stopStoryboardPolling imported and used before re-dispatch
- *   - onFrame(frame, frames) signature aligned to poller contract
- *   - accessResult.error read as flat string (no .type accessor)
+ * ISSUE B — DISPATCH_FAILED is a backend infrastructure issue, not a
+ *   code bug. The n8n webhook URL must be configured in Wix Secrets
+ *   Manager as 'N8N_STORYBOARD_WEBHOOK_URL' and the n8n workflow must
+ *   be active and reachable. See deployment checklist below.
  *
- * v.2.1.0 changes (preserved):
- *   - CR-01: showToaster() from notification.js, setButtonLoading() from ui.js
- *   - CR-04: safeHide('#pageContentContainer') as first statement in onReady
+ * DEPLOYMENT CHECKLIST (resolve DISPATCH_FAILED):
+ *   1. In Wix Dashboard → Secrets Manager:
+ *      - N8N_STORYBOARD_WEBHOOK_URL must be set to the live n8n webhook URL
+ *      - N8N_CALLBACK_SECRET_KEY must be set to the shared HMAC secret
+ *   2. In n8n workspace:
+ *      - Storyboard workflow must be ACTIVE (not draft)
+ *      - Webhook trigger node must be listening (production URL, not test URL)
+ *   3. Verify with: debugGenerateStoryboard() in Wix API Explorer
+ *
+ * v.2.3.0 changes preserved:
+ *   - startStoryboardPolling() positional signature fix
+ *   - onFrame(frame, frames) aligned to poller v.2.0.0 contract
+ *   - stopStoryboardPolling() called before re-dispatch
+ *   - Import paths: backend/services/project.web
  */
 
 import wixLocation  from 'wix-location';
@@ -35,17 +46,20 @@ import { safeDisable, safeShow, safeHide, setButtonLoading } from 'public/utils/
 import { showToaster }                                       from 'public/utils/notification';
 import { startStoryboardPolling, stopStoryboardPolling }     from 'public/utils/storyboard-poller';
 
-const VERSION           = '[ PROJECT DETAIL : v.2.3.0 ]';
+const VERSION           = '[ PROJECT DETAIL : v.2.4.0 ]';
 const PATH_UNAUTHORIZED = '/cc';
 
 // ─── MESSAGES ─────────────────────────────────────────────────────────────────
 
-const MSG_GENERATION_FAILED = 'Unable to start generation. Please try again.';
-const MSG_POLL_TIMEOUT      = "Generation is taking longer than expected. We'll notify you when it's ready.";
-const MSG_POLL_ERROR        = 'Lost connection to the generation service. Please refresh the page.';
-const MSG_PROJECT_UPDATED   = 'Project updated successfully.';
-const MSG_GENERATING        = 'Generating...';
-const MSG_GENERATE_DEFAULT  = 'Generate Storyboard';
+const MSG_GENERATION_FAILED   = 'Unable to start generation. Please try again.';
+const MSG_DISPATCH_FAILED     = 'The generation pipeline is currently unavailable. Please try again in a moment.';
+const MSG_CONFIG_ERROR        = 'Generation is not yet configured. Please contact support.';
+const MSG_ALREADY_RUNNING     = 'Generation is already in progress — resuming display.';
+const MSG_POLL_TIMEOUT        = "Generation is taking longer than expected. We'll notify you when it's ready.";
+const MSG_POLL_ERROR          = 'Lost connection to the generation service. Please refresh the page.';
+const MSG_PROJECT_UPDATED     = 'Project updated successfully.';
+const MSG_GENERATING          = 'Generating...';
+const MSG_GENERATE_DEFAULT    = 'Generate Storyboard';
 
 const BTN_GENERATE = '#btnGenerateStoryboard';
 
@@ -60,8 +74,8 @@ $w.onReady(async function () {
     console.log(`${VERSION} Initializing...`);
 
     // ── 0. SECURITY GATE — hide content BEFORE any async work ────────────────
-    // Must be the first operation. Code-enforced guarantee — do not rely on
-    // the Wix Editor 'Hidden on Load' canvas setting alone.
+    // Must be the first operation. Code-enforced — do not rely on the Wix
+    // Editor 'Hidden on Load' canvas setting alone (can be accidentally changed).
     safeHide('#pageContentContainer');
 
     // ── 1. Read project ID from the dynamic dataset ───────────────────────────
@@ -155,6 +169,8 @@ function wireEditButton() {
 
 function wireGenerateButton() {
     $w(BTN_GENERATE).onClick(async () => {
+
+        // ── Validate project fields before dispatch ───────────────────────────
         const validation = validateProjectForGeneration(_currentProject);
         if (!validation.isValid) {
             showToaster(validation.message, 'error');
@@ -173,28 +189,58 @@ function wireGenerateButton() {
         const result = await generateStoryboard(_currentProject._id);
 
         if (result.ok) {
+            // Dispatch succeeded — start polling for incoming frames
             startPolling();
-        } else {
-            setButtonLoading(BTN_GENERATE, null, MSG_GENERATE_DEFAULT);
-            safeHide('#ccLoadingPreloader');
-            showToaster(MSG_GENERATION_FAILED, 'error');
-            console.warn(`${VERSION} generateStoryboard failed:`, result.error);
+            return;
         }
+
+        // ── Route error types explicitly ──────────────────────────────────────
+        const errorType = result.error?.type || 'UNKNOWN';
+        console.warn(`${VERSION} generateStoryboard failed: type=${errorType}`, result.error);
+
+        if (errorType === 'ALREADY_RUNNING') {
+            // A generation is already in progress — attach to it rather than
+            // showing an error. The user gets a soft confirmation and the
+            // poller reveals frames as they arrive.
+            console.log(`${VERSION} ALREADY_RUNNING — resuming active generation poll.`);
+            showToaster(MSG_ALREADY_RUNNING, 'success');
+            startPolling();
+            return;
+        }
+
+        // All other errors: restore button so the user can retry.
+        setButtonLoading(BTN_GENERATE, null, MSG_GENERATE_DEFAULT);
+        safeHide('#ccLoadingPreloader');
+
+        if (errorType === 'DISPATCH_FAILED' || errorType === 'WEBHOOK_ERROR' || errorType === 'WEBHOOK_UNAVAILABLE') {
+            // n8n pipeline unreachable after all retries.
+            // RESOLUTION: Verify N8N_STORYBOARD_WEBHOOK_URL secret in Wix Secrets
+            // Manager and ensure the n8n workflow is active (not in test/draft mode).
+            showToaster(MSG_DISPATCH_FAILED, 'error');
+            return;
+        }
+
+        if (errorType === 'CONFIG_ERROR' || errorType === 'CONFIGURATION_ERROR') {
+            // Secret not configured in Wix Secrets Manager.
+            showToaster(MSG_CONFIG_ERROR, 'error');
+            return;
+        }
+
+        // Generic fallback for unexpected error types
+        showToaster(MSG_GENERATION_FAILED, 'error');
     });
 }
 
 // ─── STORYBOARD POLLING ───────────────────────────────────────────────────────
 
 /**
- * Starts the adaptive storyboard poller.
+ * Starts the adaptive storyboard poller for the current project.
  *
- * IMPORTANT — call signature:
- *   startStoryboardPolling(projectId, { onFrame, onComplete, onTimeout, onError })
- *
- * The poller (v.2.0.0) uses positional args: projectId first, callbacks object
- * second. Passing a single config object (old v.1.0.0 form) causes the poller
- * to treat the entire object as projectId, resulting in a terminal poll error
- * on the first tick and an immediate onError() invocation.
+ * SIGNATURE: startStoryboardPolling(projectId, { callbacks })
+ *   — positional args per storyboard-poller.js v.2.0.0.
+ *   — Do NOT use the old single-object form: startStoryboardPolling({ projectId, ... })
+ *     That causes the poller to receive the config object as projectId, producing
+ *     a terminal poll error on the first tick.
  */
 function startPolling() {
     _activePoller = startStoryboardPolling(_currentProject._id, {
@@ -228,8 +274,8 @@ function startPolling() {
  * Renders a newly delivered storyboard frame into the page UI.
  * Canvas-specific — adapt element IDs to the Wix Editor layout.
  *
- * @param {object} frame  — individual frame record
- * @param {array}  frames — all frames delivered so far (ascending frameIndex)
+ * @param {object} frame  — individual frame record (frameIndex, imageUrl, promptText, frameData)
+ * @param {array}  frames — all frames delivered so far, ascending by frameIndex
  */
 function renderFrame(frame, frames) {
     console.log(`${VERSION} Frame received: index ${frame.frameIndex} | total so far: ${frames.length}`);
