@@ -1,31 +1,41 @@
 /**
  * Page: Project Detail (Dynamic)
  * Path: /page_code/dashboard/project-detail.page.js
- * Version: [ PROJECT DETAIL : v.2.1.0 ]
+ * Version: [ PROJECT DETAIL : v.2.3.0 ]
  *
- * CR-01 Remediation
- * -----------------
- * REMOVED: local showError() wrapper — calls showToaster() from notification.js directly
- * REMOVED: local toggleLoadingState() — replaced by setButtonLoading() + safeShow/safeHide from ui.js
+ * v.2.3.0 — Poller Call Signature Fix
+ * ──────────────────────────────────────
+ * ISSUE: startStoryboardPolling() was being called with a single object
+ * argument: startStoryboardPolling({ projectId, onFrame, ... }).
+ * storyboard-poller.js v.2.0.0 expects a positional signature:
+ *   startStoryboardPolling(projectId, { onFrame, onComplete, onTimeout, onError })
+ * With the old call form, the poller received the entire config object as
+ * `projectId` — a truthy non-string value — and passed it to
+ * getStoryboardFrames(), which returned a terminal error on the first tick,
+ * immediately firing onError() and surfacing "Unable to start generation."
  *
- * CR-04 Remediation (privacy flash)
- * ----------------------------------
- * safeHide('#pageContentContainer') is the FIRST statement inside $w.onReady —
- * before any await — so the content is guaranteed hidden on every navigation,
- * regardless of the Wix Editor 'Hidden on Load' setting.
+ * FIX: startPolling() now uses the correct positional signature.
  *
- * Storyboard polling (from v.2.0.0) is preserved unchanged.
+ * v.2.2.0 changes (preserved):
+ *   - Import paths corrected to backend/services/project.web
+ *   - stopStoryboardPolling imported and used before re-dispatch
+ *   - onFrame(frame, frames) signature aligned to poller contract
+ *   - accessResult.error read as flat string (no .type accessor)
+ *
+ * v.2.1.0 changes (preserved):
+ *   - CR-01: showToaster() from notification.js, setButtonLoading() from ui.js
+ *   - CR-04: safeHide('#pageContentContainer') as first statement in onReady
  */
 
 import wixLocation  from 'wix-location';
 import wixWindow    from 'wix-window';
-import { verifyProjectAccess, generateStoryboard }    from 'backend/services/project.web';
-import { validateProjectForGeneration }               from 'public/utils/validation';
+import { verifyProjectAccess, generateStoryboard }           from 'backend/services/project.web';
+import { validateProjectForGeneration }                      from 'public/utils/validation';
 import { safeDisable, safeShow, safeHide, setButtonLoading } from 'public/utils/ui';
-import { showToaster }                                from 'public/utils/notification';
-import { startStoryboardPolling, stopStoryboardPolling } from 'public/utils/storyboard-poller';
+import { showToaster }                                       from 'public/utils/notification';
+import { startStoryboardPolling, stopStoryboardPolling }     from 'public/utils/storyboard-poller';
 
-const VERSION           = '[ PROJECT DETAIL : v.2.1.0 ]';
+const VERSION           = '[ PROJECT DETAIL : v.2.3.0 ]';
 const PATH_UNAUTHORIZED = '/cc';
 
 // ─── MESSAGES ─────────────────────────────────────────────────────────────────
@@ -50,9 +60,8 @@ $w.onReady(async function () {
     console.log(`${VERSION} Initializing...`);
 
     // ── 0. SECURITY GATE — hide content BEFORE any async work ────────────────
-    // This must be the first operation. Do NOT rely solely on the Wix Editor
-    // 'Hidden on Load' setting — that is a canvas config that can be
-    // accidentally changed. This line is the code-enforced guarantee.
+    // Must be the first operation. Code-enforced guarantee — do not rely on
+    // the Wix Editor 'Hidden on Load' canvas setting alone.
     safeHide('#pageContentContainer');
 
     // ── 1. Read project ID from the dynamic dataset ───────────────────────────
@@ -69,7 +78,7 @@ $w.onReady(async function () {
     const accessResult = await verifyProjectAccess(datasetItem._id);
 
     if (!accessResult.ok || !accessResult.authorized) {
-        const reason = accessResult.error?.type || 'UNKNOWN';
+        const reason = accessResult.error?.type || accessResult.error || 'UNKNOWN';
         console.warn(`${VERSION} Access denied. Reason: ${reason}. Redirecting.`);
         wixLocation.to(PATH_UNAUTHORIZED);
         return;
@@ -84,7 +93,7 @@ $w.onReady(async function () {
     wireEditButton();
     wireGenerateButton();
 
-    // Resume polling if user navigated back mid-generation
+    // Resume polling if the user navigated back mid-generation
     if (_currentProject.storyboardStatus === 'generating') {
         console.log(`${VERSION} Generation in progress on load — resuming poll.`);
         startPolling();
@@ -133,7 +142,6 @@ function wireEditButton() {
                 showToaster(MSG_PROJECT_UPDATED, 'success');
 
             } else if (result?.errorMessage) {
-                // Modal closed with an error — surface it via the global toaster
                 showToaster(result.errorMessage, 'error');
             }
 
@@ -156,7 +164,7 @@ function wireGenerateButton() {
         setButtonLoading(BTN_GENERATE, MSG_GENERATING, MSG_GENERATE_DEFAULT);
         safeShow('#ccLoadingPreloader');
 
-        // Stop any existing poller before dispatching a new generation
+        // Stop any existing poller before dispatching a new generation run
         if (_activePoller) {
             stopStoryboardPolling(_activePoller);
             _activePoller = null;
@@ -170,36 +178,62 @@ function wireGenerateButton() {
             setButtonLoading(BTN_GENERATE, null, MSG_GENERATE_DEFAULT);
             safeHide('#ccLoadingPreloader');
             showToaster(MSG_GENERATION_FAILED, 'error');
+            console.warn(`${VERSION} generateStoryboard failed:`, result.error);
         }
     });
 }
 
 // ─── STORYBOARD POLLING ───────────────────────────────────────────────────────
 
+/**
+ * Starts the adaptive storyboard poller.
+ *
+ * IMPORTANT — call signature:
+ *   startStoryboardPolling(projectId, { onFrame, onComplete, onTimeout, onError })
+ *
+ * The poller (v.2.0.0) uses positional args: projectId first, callbacks object
+ * second. Passing a single config object (old v.1.0.0 form) causes the poller
+ * to treat the entire object as projectId, resulting in a terminal poll error
+ * on the first tick and an immediate onError() invocation.
+ */
 function startPolling() {
-    _activePoller = startStoryboardPolling({
-        projectId: _currentProject._id,
-        onFrame:   (frame) => renderFrame(frame),
-        onComplete: () => {
+    _activePoller = startStoryboardPolling(_currentProject._id, {
+        onFrame(frame, frames) {
+            renderFrame(frame, frames);
+        },
+        onComplete(frames) {
+            console.log(`${VERSION} Generation complete. Total frames: ${frames.length}`);
+            _activePoller = null;
             setButtonLoading(BTN_GENERATE, null, MSG_GENERATE_DEFAULT);
             safeHide('#ccLoadingPreloader');
         },
-        onTimeout: () => {
+        onTimeout() {
+            console.warn(`${VERSION} Polling timed out.`);
+            _activePoller = null;
             setButtonLoading(BTN_GENERATE, null, MSG_GENERATE_DEFAULT);
             safeHide('#ccLoadingPreloader');
             showToaster(MSG_POLL_TIMEOUT, 'error');
         },
-        onError: () => {
+        onError(error) {
+            console.error(`${VERSION} Polling terminal error:`, error);
+            _activePoller = null;
             setButtonLoading(BTN_GENERATE, null, MSG_GENERATE_DEFAULT);
             safeHide('#ccLoadingPreloader');
             showToaster(MSG_POLL_ERROR, 'error');
-        }
+        },
     });
 }
 
-function renderFrame(frame) {
-    // Frame rendering logic is canvas-specific — implement as needed.
-    console.log(`${VERSION} Frame received:`, frame);
+/**
+ * Renders a newly delivered storyboard frame into the page UI.
+ * Canvas-specific — adapt element IDs to the Wix Editor layout.
+ *
+ * @param {object} frame  — individual frame record
+ * @param {array}  frames — all frames delivered so far (ascending frameIndex)
+ */
+function renderFrame(frame, frames) {
+    console.log(`${VERSION} Frame received: index ${frame.frameIndex} | total so far: ${frames.length}`);
+    // TODO: wire to repeater / canvas elements
 }
 
 // ─── DEBUG ────────────────────────────────────────────────────────────────────

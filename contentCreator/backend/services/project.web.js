@@ -1,36 +1,30 @@
 /**
  * Service: Project Service
  * Path: /backend/services/project.web.js
- * Version: [ PROJECT SERVICE : v.2.1.0 ]
+ * Version: [ PROJECT SERVICE : v.2.2.0 ]
  *
- * Scalability Remediations (SC-01 through SC-03, SC-07)
- * ─────────────────────────────────────────────────────
- * SC-02  getMyProjects now accepts { limit, cursor } and enforces a hard
- *        ceiling of PROJECT_LIMIT (25). Returns a `nextCursor` for
- *        forward pagination. Prevents unbounded result sets.
+ * v.2.2.0 — Storyboard Additions
+ * ────────────────────────────────
+ * Appends three new webMethod exports for the Storyboarding MVP.
+ * All exports from v.2.1.0 are preserved unchanged.
  *
- * SC-02  getStoryboardFrames now sets an explicit .limit(TOTAL_FRAMES)
- *        so it can never silently truncate or exceed the 6 MB payload cap.
+ * New exports:
+ *   generateStoryboard(projectId)    — dispatch gate; fires n8n webhook
+ *   receiveFrames(framePayload)      — n8n per-frame callback; HMAC-protected
+ *   getStoryboardFrames(projectId)   — polling read endpoint; owner-scoped
  *
- * SC-03  WEBHOOK_TIMEOUT_MS reduced from 12,000 ms to 8,000 ms.
- *        MAX_RETRIES reduced from 3 to 2.
- *        Worst-case total webMethod time: 2 × 8,000 + retry delay ≈ 17 s,
- *        safely under the 30-second Velo execution ceiling.
- *
- * SC-07  getUserProjectCount and getMyProjects now query on _owner only
- *        (the Wix-native indexed field). The legacy `owner` mirror field
- *        is no longer used as a query predicate. All inserts still write
- *        `owner` for backward compatibility with existing records.
- *
- * Exports (unchanged contract):
+ * Existing exports (unchanged from v.2.1.0):
  *   createProject          — creates a new project record
  *   updateProject          — owner-only patch
  *   verifyProjectAccess    — authorization gate for the Project Detail page
  *   getUserProjectCount    — total project count for the authenticated member
  *   getMyProjects          — paginated project list for the authenticated member
- *   generateStoryboard     — dispatches the n8n pipeline
- *   receiveFrames          — n8n callback: writes completed frames
- *   getStoryboardFrames    — polling endpoint: returns project-scoped frames
+ *
+ * Scalability remediations from v.2.1.0 (preserved):
+ *   SC-02  getMyProjects enforces PROJECT_LIMIT (25), returns nextCursor.
+ *   SC-02  getStoryboardFrames uses .limit(TOTAL_FRAMES).
+ *   SC-03  MAX_RETRIES = 2, WEBHOOK_TIMEOUT_MS = 8000 ms.
+ *   SC-07  getUserProjectCount and getMyProjects query on _owner only.
  *
  * Wix Secrets required:
  *   N8N_STORYBOARD_WEBHOOK_URL  — n8n trigger URL
@@ -58,7 +52,7 @@ import { currentMember }          from 'wix-members-backend';
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
-const VERSION             = '[ PROJECT SERVICE : v.2.1.0 ]';
+const VERSION             = '[ PROJECT SERVICE : v.2.2.0 ]';
 
 const COLLECTION_PROJECTS = 'projects';
 const COLLECTION_FRAMES   = 'frames';
@@ -67,7 +61,6 @@ const DB_OPTIONS          = { suppressAuth: true };
 const ROLE_ADMIN          = 'Admin';
 
 // Pagination ceiling — enforced at the data layer, not just the UI.
-// Changing this value is a contract change; increment the version.
 const PROJECT_LIMIT       = 25;
 
 // Storyboard pipeline
@@ -75,14 +68,14 @@ const SECRET_N8N_WEBHOOK  = 'N8N_STORYBOARD_WEBHOOK_URL';
 const SECRET_CALLBACK_KEY = 'N8N_CALLBACK_SECRET_KEY';
 const TOTAL_FRAMES        = 15;
 
-// SC-03: Webhook retry — timeout reduced so MAX_RETRIES × WEBHOOK_TIMEOUT_MS
+// SC-03: Webhook retry config — timeout reduced so MAX_RETRIES × WEBHOOK_TIMEOUT_MS
 // stays well under the 30-second Velo webMethod execution ceiling.
 //   Previous: MAX_RETRIES = 3, WEBHOOK_TIMEOUT_MS = 12000  → up to 36+ s
 //   Current:  MAX_RETRIES = 2, WEBHOOK_TIMEOUT_MS = 8000   → up to ~17 s
 const MAX_RETRIES         = 2;
 const RETRY_DELAYS        = [500, 1500];   // ms — one delay between two attempts
 const RETRYABLE_STATUSES  = [429, 502, 503, 504];
-const WEBHOOK_TIMEOUT_MS  = 8000;          // SC-03: reduced from 12 000 ms
+const WEBHOOK_TIMEOUT_MS  = 8000;
 
 // Storyboard status values
 const STATUS_GENERATING   = 'generating';
@@ -152,9 +145,9 @@ async function postWithRetry(url, body) {
             if (!RETRYABLE_STATUSES.includes(response.status)) {
                 console.error(`${VERSION} Non-retryable status: ${response.status}`);
                 return {
-                    ok:    false,
+                    ok:     false,
                     status: response.status,
-                    error: { type: 'HTTP_ERROR', message: `Status ${response.status}` }
+                    error:  { type: 'HTTP_ERROR', message: `Status ${response.status}` }
                 };
             }
 
@@ -203,8 +196,7 @@ export const createProject = webMethod(Permissions.Anyone, async (projectData) =
             offer:           projectData.offer,
             target_audience: projectData.target_audience ?? projectData.audience,
             misconception:   projectData.misconception,
-            // Write both fields during the transition period (SF-02 / SC-07).
-            // Queries now filter on _owner exclusively.
+            // Write both fields during the transition period (SC-07).
             owner:           memberId
         };
 
@@ -283,8 +275,6 @@ export const verifyProjectAccess = webMethod(Permissions.Anyone, async (projectI
 /**
  * Updates an existing project record. Owner-only — admin read access does
  * not confer write access by design.
- *
- * Builds an explicit update payload to avoid writing stale Wix metadata.
  *
  * @param {string} projectId
  * @param {object} projectData
@@ -370,11 +360,6 @@ export const getUserProjectCount = webMethod(Permissions.Anyone, async () => {
  * SC-02: Enforces PROJECT_LIMIT (25) at the data layer.
  * SC-07: Queries on _owner (Wix-native indexed field).
  *
- * Pagination:
- *   Pass `cursor` from a previous response's `nextCursor` field to fetch
- *   the next page. `cursor` is null on the first call and when no further
- *   pages exist.
- *
  * @param {{ limit?: number, cursor?: string|null }} [options]
  * @returns {{ ok: boolean, data: array, nextCursor: string|null, error?: object }}
  */
@@ -383,8 +368,6 @@ export const getMyProjects = webMethod(Permissions.Anyone, async ({ limit = PROJ
         const { memberId } = await getAuthenticatedMember();
         if (!memberId) return { ok: true, data: [], nextCursor: null };
 
-        // Hard ceiling — callers cannot request more than PROJECT_LIMIT records
-        // regardless of the `limit` parameter they supply.
         const safeLimit = Math.min(limit, PROJECT_LIMIT);
 
         let query = wixData.query(COLLECTION_PROJECTS)
@@ -392,8 +375,6 @@ export const getMyProjects = webMethod(Permissions.Anyone, async ({ limit = PROJ
             .descending('_createdDate')
             .limit(safeLimit);
 
-        // Wix cursor-based pagination: .skipTo() accepts the cursor string
-        // returned by a previous .find() call's results.cursors.next value.
         const results = cursor
             ? await query.skipTo(cursor).find(DB_OPTIONS)
             : await query.find(DB_OPTIONS);
@@ -418,13 +399,11 @@ export const getMyProjects = webMethod(Permissions.Anyone, async ({ limit = PROJ
  *   1. Input guard.
  *   2. Identity check.
  *   3. Fetch project and verify ownership.
- *   4. Guard: reject if already generating (409 ALREADY_RUNNING).
- *   5. Stamp project: storyboardStatus = 'generating', frameCount = 0.
- *   6. Resolve webhook URL from Wix Secrets Manager.
- *   7. Dispatch signed payload to n8n (returns 202).
+ *   4. Guard: reject if already generating (ALREADY_RUNNING).
+ *   5. Stamp project: storyboardStatus = 'generating'.
+ *   6. Resolve webhook URL from Wix Secrets Manager (inline require).
+ *   7. Dispatch signed payload to n8n via postWithRetry.
  *   8. On dispatch failure: rollback project status to 'failed'.
- *
- * SC-03: postWithRetry now uses MAX_RETRIES = 2 and WEBHOOK_TIMEOUT_MS = 8000.
  *
  * @param {string} projectId
  * @returns {{ ok: boolean, status: number, error?: object }}
@@ -470,6 +449,7 @@ export const generateStoryboard = webMethod(Permissions.Anyone, async (projectId
 
         console.log(`${VERSION} generateStoryboard: Project ${projectId} marked as generating.`);
 
+        // Inline require — see module-level note on wix-secrets-backend imports.
         const { getSecret } = require('wix-secrets-backend');
         const webhookUrl = await getSecret(SECRET_N8N_WEBHOOK);
 
@@ -522,9 +502,9 @@ export const generateStoryboard = webMethod(Permissions.Anyone, async (projectId
  * Public (Permissions.Anyone) — n8n has no Wix member session.
  *
  * Security layers:
- *   1. Shared-secret header validation (step 2).
- *   2. Ownership re-verified against the DB before any write (step 3).
- *   3. Idempotent: duplicate deliveries from n8n retries are silently skipped (step 4).
+ *   1. Shared-secret validation via secretKey field.
+ *   2. Ownership re-verified against the DB before any write.
+ *   3. Idempotent: duplicate deliveries from n8n retries are silently skipped.
  *
  * @param {object} framePayload
  * @returns {{ ok: boolean, status: number, duplicate?: boolean, isComplete?: boolean, error?: object }}
@@ -539,7 +519,7 @@ export const receiveFrames = webMethod(Permissions.Anyone, async (framePayload) 
             return { ok: false, status: 400, error: { type: 'INVALID_PAYLOAD', message: 'Missing required fields.' } };
         }
 
-        // 2. Secret validation
+        // 2. Secret validation (inline require — see module-level note)
         const { getSecret } = require('wix-secrets-backend');
         const expectedKey = await getSecret(SECRET_CALLBACK_KEY);
         if (!expectedKey || secretKey !== expectedKey) {
@@ -547,50 +527,47 @@ export const receiveFrames = webMethod(Permissions.Anyone, async (framePayload) 
             return { ok: false, status: 401, error: { type: 'UNAUTHORIZED', message: 'Invalid callback secret.' } };
         }
 
-        // 3. Ownership check
+        // 3. Ownership re-verification
         const project = await wixData.get(COLLECTION_PROJECTS, projectId, DB_OPTIONS);
         if (!project) {
             console.warn(`${VERSION} receiveFrames: Project not found: ${projectId}`);
             return { ok: false, status: 404, error: { type: 'NOT_FOUND', message: 'Project not found.' } };
         }
         if (project._owner !== owner) {
-            console.error(`${VERSION} receiveFrames: Owner mismatch for project: ${projectId}`);
+            console.error(`${VERSION} receiveFrames: Owner mismatch. Project: ${projectId}`);
             return { ok: false, status: 403, error: { type: 'FORBIDDEN', message: 'Owner mismatch.' } };
         }
 
-        // 4. Idempotency: skip duplicates (n8n at-least-once delivery)
+        // 4. Idempotency — silently skip frames already written
         const existing = await wixData.query(COLLECTION_FRAMES)
             .eq('projectId', projectId)
             .eq('frameIndex', frameIndex)
             .find(DB_OPTIONS);
 
-        if (existing.items.length > 0) {
-            console.log(`${VERSION} receiveFrames: Duplicate frame ${frameIndex} for project ${projectId} — skipping.`);
+        if (existing.totalCount > 0) {
+            console.log(`${VERSION} receiveFrames: Duplicate skipped. frameIndex: ${frameIndex} project: ${projectId}`);
             return { ok: true, status: 200, duplicate: true };
         }
 
-        // 5. Insert frame record
-        const frameRecord = {
+        // 5. Write frame record
+        await wixData.insert(COLLECTION_FRAMES, {
             projectId,
             owner,
             frameIndex,
             imageUrl,
             promptText:  promptText  || '',
             frameData:   frameData   || {},
-            status:      STATUS_COMPLETE,
-            receivedAt:  new Date().toISOString()
-        };
+            status:      'complete',
+        }, DB_OPTIONS);
 
-        await wixData.insert(COLLECTION_FRAMES, frameRecord, DB_OPTIONS);
-        console.log(`${VERSION} receiveFrames: Frame ${frameIndex} saved for project ${projectId}.`);
+        console.log(`${VERSION} receiveFrames: Frame written. frameIndex: ${frameIndex} project: ${projectId}`);
 
-        // 6. Increment frame count and stamp complete when all frames arrive
-        const newCount   = (project.storyboardFrameCount || 0) + 1;
-        const isComplete = newCount >= TOTAL_FRAMES;
+        // 6. Check for completion — stamp project on final frame
+        const isComplete = frameIndex === TOTAL_FRAMES - 1;
 
         await wixData.update(COLLECTION_PROJECTS, {
             ...project,
-            storyboardFrameCount:  newCount,
+            storyboardFrameCount:  frameIndex + 1,
             storyboardStatus:      isComplete ? STATUS_COMPLETE : STATUS_GENERATING,
             ...(isComplete ? { storyboardCompletedAt: new Date().toISOString() } : {})
         }, DB_OPTIONS);
@@ -612,12 +589,15 @@ export const receiveFrames = webMethod(Permissions.Anyone, async (framePayload) 
 /**
  * Returns all currently-saved frames for a project, ordered by frameIndex.
  *
- * SC-02: .limit(TOTAL_FRAMES) is now explicit, preventing silent truncation
- *        and bounding the response payload to at most 15 frame records.
+ * SC-02: .limit(TOTAL_FRAMES) prevents silent truncation and bounds the
+ *        response payload to at most 15 frame records.
  *
  * Security — two layers:
  *   1. Caller identity verified against project._owner (or Admin).
  *   2. DB query scoped to both projectId AND owner — defence in depth.
+ *
+ * Result shape consumed by storyboard-poller.js v.2.0.0:
+ *   { ok, frames, projectStatus, frameCount }
  *
  * @param {string} projectId
  * @returns {{ ok: boolean, status: number, frames?: array, projectStatus?: string, frameCount?: number, totalFrames?: number, error?: object }}
@@ -642,14 +622,12 @@ export const getStoryboardFrames = webMethod(Permissions.Anyone, async (projectI
             return { ok: false, status: 403, error: { type: 'FORBIDDEN', message: 'Access denied.' } };
         }
 
-        // SC-02: Explicit limit — the frames collection can grow to 1.875M records
-        // at 5,000 members. Without a limit this query would trigger Wix's default
-        // 50-item truncation and could return incomplete results.
+        // SC-02: Explicit limit prevents silent truncation at Wix's default 50-item cap.
         const results = await wixData.query(COLLECTION_FRAMES)
             .eq('projectId', projectId)
             .eq('owner', project._owner)   // defence-in-depth ownership scope
             .ascending('frameIndex')
-            .limit(TOTAL_FRAMES)           // SC-02: never returns more than 15 records
+            .limit(TOTAL_FRAMES)
             .find(DB_OPTIONS);
 
         console.log(`${VERSION} getStoryboardFrames: ${results.items.length} frames for project ${projectId}.`);

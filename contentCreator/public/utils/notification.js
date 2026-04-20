@@ -1,17 +1,30 @@
 /**
  * Utility: Notifications & User Feedback
  * Path: /public/utils/notification.js
- * Version: [ NOTIFICATIONS : v.2.0.0 ]
+ * Version: [ NOTIFICATIONS : v.2.1.0 ]
  *
- * CR-01 Remediation
- * -----------------
- * This file is the SOLE owner of all user-visible feedback primitives.
- * No page controller or modal may define its own showError, showInlineError,
- * clearInlineError, or showToaster. Import from here instead.
+ * v.2.1.0 — Master Page Toaster Fix
+ * ────────────────────────────────────
+ * ISSUE: showToaster() used $w('#globalToaster') directly. In Velo, $w()
+ * is page-scoped. When this utility is called from a page controller or
+ * another public utility, $w() resolves against that page's element tree —
+ * NOT the Master Page canvas. #globalToaster and #toasterMsg live on the
+ * Master Page and are therefore unreachable, producing the warning:
+ *   "showToaster: #globalToaster not found on this page."
  *
- * Canvas requirements (Master Page):
- *   #globalToaster  — collapsible container (Box or Strip)
- *   #toasterMsg     — Text element inside #globalToaster
+ * FIX: All $w() access for the global toaster is now delegated to
+ * `triggerGlobalToaster()` exported from masterPage.js. Because that
+ * function executes within the Master Page module scope, its $w() calls
+ * resolve correctly against the Master Page canvas at runtime.
+ *
+ * showInlineError() and clearInlineError() are unaffected — they operate
+ * on page-local elements and their $w() calls are intentionally page-scoped.
+ *
+ * Existing export signatures are fully backward compatible.
+ *
+ * Canvas requirements:
+ *   Master Page: #globalToaster, #toasterMsg  (managed by masterPage.js)
+ *   Page-local:  per-selector inline error elements (managed by callers)
  *
  * Exports:
  *   showToaster(message, type)
@@ -20,16 +33,16 @@
  *   debugNotifications()
  */
 
-const VERSION = '[ NOTIFICATIONS : v.2.0.0 ]';
+import { triggerGlobalToaster } from 'public/pages/masterPage';
+
+const VERSION = '[ NOTIFICATIONS : v.2.1.0 ]';
 
 // ─── SHARED CONSTANTS ─────────────────────────────────────────────────────────
 
-export const MSG_GENERIC_ERROR  = "Something went wrong. Please try again or contact support.";
-export const MSG_UPDATE_SUCCESS = "Settings updated successfully.";
-export const MSG_SAVE_FAILED    = "Unable to save. Please try again.";
+export const MSG_GENERIC_ERROR  = 'Something went wrong. Please try again or contact support.';
+export const MSG_UPDATE_SUCCESS = 'Settings updated successfully.';
+export const MSG_SAVE_FAILED    = 'Unable to save. Please try again.';
 
-// How long the global toaster stays visible before auto-collapsing (ms).
-const TOASTER_DURATION_MS      = 4000;
 // Default duration for inline field errors (ms).
 const INLINE_ERROR_DURATION_MS = 6000;
 
@@ -38,67 +51,43 @@ const INLINE_ERROR_DURATION_MS = 6000;
 /**
  * Displays the site-wide feedback bar on the Master Page.
  *
- * Uses the canonical element IDs agreed in CR-02:
- *   #globalToaster  — the collapsible container
- *   #toasterMsg     — the text element inside it
+ * Delegates to triggerGlobalToaster() in masterPage.js so that the
+ * $w('#globalToaster') call executes in the Master Page scope, where
+ * the element actually exists.
  *
  * Safe to call from page controllers, modals, and utilities.
- * Falls back to a console warning if the elements are absent (e.g. during
- * unit testing or if called from a page that does not have the master page).
  *
- * @param {string} message - Human-readable message to display.
- * @param {'success'|'error'} [type='success'] - Visual style variant.
+ * @param {string} message
+ * @param {'success'|'error'} [type='success']
  */
 export function showToaster(message, type = 'success') {
-    const $toaster = $w('#globalToaster');
-    const $text    = $w('#toasterMsg');
-
-    // $w() never returns null in Velo — it returns an inert proxy when the
-    // element does not exist on the page. Checking for .expand guards against
-    // calling on that proxy, which has no methods.
-    if (typeof $toaster?.expand !== 'function') {
-        console.warn(`${VERSION} showToaster: #globalToaster not found on this page. Message was: "${message}"`);
-        return;
+    try {
+        triggerGlobalToaster(message, type);
+    } catch (err) {
+        // Defensive fallback — log and do not throw so callers are never
+        // interrupted by a notification failure.
+        console.warn(`${VERSION} showToaster: triggerGlobalToaster failed. Message was: "${message}"`, err);
     }
-
-    if (typeof $text?.text === 'undefined') {
-        console.warn(`${VERSION} showToaster: #toasterMsg not found on this page.`);
-        return;
-    }
-
-    $text.text = message;
-
-    if ($toaster.style) {
-        $toaster.style.backgroundColor = (type === 'success') ? '#7bef8593' : '#FFEBEE';
-    }
-
-    $toaster.expand()
-        .then(() => setTimeout(() => $toaster.collapse(), TOASTER_DURATION_MS))
-        .catch(err => console.warn(`${VERSION} showToaster expand/collapse error:`, err));
-
-    console.log(`${VERSION} [${type.toUpperCase()}] ${message}`);
 }
 
 // ─── INLINE FIELD ERRORS ──────────────────────────────────────────────────────
 
 /**
- * Expands a collapsible error element on the page and auto-collapses it
- * after a timeout.
+ * Expands a collapsible error element on the current page and auto-collapses
+ * it after a timeout.
  *
- * Replaces all local showError() / showInlineError() implementations in
- * modals and page controllers.
+ * These elements are page-local — $w() is correctly page-scoped here.
+ * Falls back to the global toaster if the element is not found, so the
+ * message is never silently dropped.
  *
- * @param {string} selector    - The $w selector for the error element
- *                               (e.g. '#newProjectError', '#errorMsgCompanyDetails').
- * @param {string} message     - The error message to display.
- * @param {number} [timeoutMs] - Override the default auto-dismiss duration.
+ * @param {string} selector    - e.g. '#newProjectError'
+ * @param {string} message
+ * @param {number} [timeoutMs]
  */
 export function showInlineError(selector, message, timeoutMs = INLINE_ERROR_DURATION_MS) {
     const $el = $w(selector);
 
     if (typeof $el?.expand !== 'function') {
-        // Element not present on this page/modal — fall back to the global toaster
-        // so the message is never silently dropped.
         console.warn(`${VERSION} showInlineError: ${selector} not found. Falling back to toaster.`);
         showToaster(message, 'error');
         return;
@@ -115,17 +104,14 @@ export function showInlineError(selector, message, timeoutMs = INLINE_ERROR_DURA
 }
 
 /**
- * Collapses an inline error element without waiting for the timeout.
- * Call this when validation passes to immediately clear a previous error.
+ * Collapses an inline error element immediately.
+ * Call when validation passes to clear a previous error without waiting.
  *
- * @param {string} selector - The $w selector for the error element.
+ * @param {string} selector
  */
 export function clearInlineError(selector) {
     const $el = $w(selector);
-
-    if (typeof $el?.collapse !== 'function') return;
-
-    $el.collapse();
+    if (typeof $el?.collapse === 'function') $el.collapse();
 }
 
 // ─── DEBUG ────────────────────────────────────────────────────────────────────
