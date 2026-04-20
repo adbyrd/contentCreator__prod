@@ -1,92 +1,69 @@
 /**
  * Page Code: Master Page (Global)
  * Path: /page_code/global/masterPage.js
- * Version: [ MASTER PAGE : v.1.5.0 ]
+ * Version: [ MASTER PAGE : v.1.6.0 ]
  *
- * v.1.5.0 — Cross-Scope Toaster via postMessage
- * ───────────────────────────────────────────────
- * PROBLEM: Velo's $w() is always bound to the scope of the module that
- * calls it at runtime, not the module where the function is defined.
- * Exporting a function from masterPage.js and calling it from a public
- * utility or page controller does NOT transfer the Master Page's $w scope
- * to that call — $w still resolves against the calling page's DOM, where
- * #globalToaster does not exist.
+ * v.1.6.0 — Revert postMessage / onMessage approach
+ * ───────────────────────────────────────────────────
+ * REMOVED: wixWindow.onMessage() listener (v.1.5.0)
  *
- * SOLUTION: The Master Page owns its own elements exclusively and listens
- * for toaster requests via wixWindow.onMessage(). Page code and utilities
- * send requests via wixWindow.postMessage(). This is the only Velo-supported
- * pattern for cross-scope DOM operations targeting Master Page elements.
+ * ROOT CAUSE: wixWindow.onMessage() is a lightbox API — it is only available
+ * inside a lightbox page and on the page that opened it. It does not exist on
+ * the regular page or master page context. Calling it throws:
+ *   TypeError: i(...).onMessage is not a function
+ * This crashed the entire Master Page $w.onReady() before any element wiring
+ * could complete, making every element on the Master Page non-functional.
  *
- * Message contract (channel: 'SHOW_TOASTER'):
- *   Sender  → wixWindow.postMessage({ channel: 'SHOW_TOASTER', message, type })
- *   Receiver → masterPage.js onMessage handler calls _showToaster(message, type)
+ * CORRECT SCOPE ARCHITECTURE (Velo 2026):
+ *   $w()          — resolves elements in the current module's page scope only.
+ *   wixWindow.postMessage / onMessage — lightbox ↔ opener only.
+ *   Master Page elements — accessible only from masterPage.js via $w().
+ *   Page-to-master communication — not supported via any Velo API.
  *
- * notification.js is updated to use postMessage instead of $w() directly
- * or via an exported function. No other files need changes.
- *
- * v.1.4.0 changes preserved:
- *   - triggerGlobalToaster export REMOVED (did not work — see above)
- *   - Logout uses _showToaster() directly (same scope, works correctly)
+ * RESOLUTION for the global toaster (Issue #2):
+ *   The #globalToaster element is duplicated onto each dashboard page canvas
+ *   in the Wix Editor. notification.js calls $w('#globalToaster') from page
+ *   code, which resolves correctly because the element now exists on the page.
+ *   The Master Page retains its own copy for its own error states (e.g. logout).
+ *   See notification.js v.2.3.0 for full details.
  *
  * Canvas requirements (Master Page):
- *   #globalToaster  — collapsible container (Box or Strip)
+ *   #globalToaster  — collapsible container on the Master Page canvas (for logout errors)
  *   #toasterMsg     — Text element inside #globalToaster
  *   #btnLogOut      — Logout button
  */
 
 import wixLocation        from 'wix-location';
-import wixWindow          from 'wix-window';
 import { authentication } from 'wix-members';
 
-const VERSION             = '[ MASTER PAGE : v.1.5.0 ]';
+const VERSION             = '[ MASTER PAGE : v.1.6.0 ]';
 const MSG_ERROR_GENERIC   = 'Technical error encountered. Please try again later.';
 const PATH_HOME           = 'https://www.adbyrd.com/cc';
 const TOASTER_DURATION_MS = 4000;
-const TOASTER_CHANNEL     = 'SHOW_TOASTER';
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 
 $w.onReady(function () {
     console.log(`${VERSION} Global Master Page Initialized.`);
 
-    // ── Listen for cross-scope toaster requests from page code / utilities ───
-    // This is the only Velo-supported way for page-scoped code to trigger
-    // an element that lives on the Master Page canvas.
-    wixWindow.onMessage((event) => {
-        const { channel, message, type } = event.data || {};
-        if (channel === TOASTER_CHANNEL && message) {
-            console.log(`${VERSION} onMessage received — channel: ${TOASTER_CHANNEL}`);
-            _showToaster(message, type || 'success');
-        }
-    });
-
-    // ── Wire logout button ───────────────────────────────────────────────────
     $w('#btnLogOut').onClick(async () => {
         await _handleLogOut();
     });
 });
 
-// ─── TOASTER (Master Page scope — $w resolves correctly here) ─────────────────
+// ─── TOASTER (Master Page scope only) ────────────────────────────────────────
 
 /**
- * Shows the global toaster. MUST be called only from within masterPage.js
- * so that $w() resolves against the Master Page canvas.
- * External callers must use wixWindow.postMessage({ channel: 'SHOW_TOASTER', ... }).
- *
- * @param {string} message
- * @param {'success'|'error'} [type='success']
+ * Shows the toaster for Master Page-level errors (e.g. logout failure).
+ * Operates on the Master Page canvas copy of #globalToaster.
+ * NOT exported — not callable from page code. Page code has its own copy.
  */
-function _showToaster(message, type = 'success') {
+function _showToaster(message, type = 'error') {
     const $toaster = $w('#globalToaster');
     const $text    = $w('#toasterMsg');
 
     if (typeof $toaster?.expand !== 'function') {
-        console.warn(`${VERSION} _showToaster: #globalToaster not found on Master Page canvas.`);
-        return;
-    }
-
-    if (typeof $text?.text === 'undefined') {
-        console.warn(`${VERSION} _showToaster: #toasterMsg not found on Master Page canvas.`);
+        console.warn(`${VERSION} _showToaster: #globalToaster not on Master Page canvas.`);
         return;
     }
 
@@ -98,7 +75,7 @@ function _showToaster(message, type = 'success') {
 
     $toaster.expand()
         .then(() => setTimeout(() => $toaster.collapse(), TOASTER_DURATION_MS))
-        .catch(err => console.warn(`${VERSION} _showToaster expand/collapse error:`, err));
+        .catch(err => console.warn(`${VERSION} _showToaster error:`, err));
 
     console.log(`${VERSION} [${type.toUpperCase()}] ${message}`);
 }
