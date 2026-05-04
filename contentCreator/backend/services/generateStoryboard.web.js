@@ -1,28 +1,60 @@
-// [ FILE NAME : generateStoryboard.web.js : v1.0.0 ]
+// [ FILE NAME : generateStoryboard.web.js : v1.0.1 ]
 // Domain  : Storyboard
 // Layer   : Backend — Dispatch Gate
 // Purpose : Validates caller ownership, guards duplicate runs, stamps project
-//           status, assembles the full n8n payload, and fires the signed webhook
-//           via postWithRetry (3 attempts, exponential back-off).
+//           status, assembles the full n8n payload, computes HMAC-SHA256 signature,
+//           and fires the signed webhook via postWithRetry (3 attempts, exponential back-off).
+//
+// CHANGELOG v1.0.1
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX: postWithRetry was dispatching the webhook without the X-HMAC-Signature
+//      header. The n8n pipeline's Stage 1 Validate HMAC + Payload node performs
+//      a mandatory HMAC-SHA256 check on every inbound request and correctly
+//      rejected all calls with HTTP 401 UNAUTHORIZED.
+//
+// CHANGES:
+//   1. getSecret() now also retrieves N8N_CALLBACK_SECRET_KEY alongside
+//      N8N_STORYBOARD_WEBHOOK_URL in a single parallel Promise.all() call.
+//   2. New hmacSign() helper computes HMAC-SHA256 hex digest of the serialised
+//      payload using the shared secret.
+//   3. postWithRetry() now accepts the computed signature and attaches it as
+//      the X-HMAC-Signature header on every attempt — including retries.
+//   4. The secret value is never logged (AI Governance Framework §6.1).
+// ─────────────────────────────────────────────────────────────────────────────
 
 import { Permissions, webMethod } from 'wix-web-module';
 import { getSecret }              from 'wix-secrets-backend';
 import wixData                    from 'wix-data';
 import { currentMember }         from 'wix-members-backend';
 import { fetch }                  from 'wix-fetch';
+import { hmac }                   from 'wix-crypto-backend'; // Wix HMAC-SHA256 utility
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const VERSION       = '[ GENERATE STORYBOARD : v1.0.0 ]';
+const VERSION       = '[ GENERATE STORYBOARD : v1.0.1 ]';
 const COLLECTION    = 'projects';
 const MAX_RETRIES   = 3;
 const BASE_DELAY_MS = 500;
 
 // ─── Structured response helpers ─────────────────────────────────────────────
-const ok    = (data)          => ({ ok: true,  status: 200, data });
-const fail  = (status, type, message) => ({ ok: false, status, error: { type, message } });
+const ok   = (data)                  => ({ ok: true,  status: 200, data });
+const fail = (status, type, message) => ({ ok: false, status, error: { type, message } });
+
+// ─── hmacSign ─────────────────────────────────────────────────────────────────
+// Computes HMAC-SHA256 hex digest of a serialised payload.
+// The secret is the shared value stored in both Wix Secrets Manager
+// (N8N_CALLBACK_SECRET_KEY) and the n8n environment variable of the same name.
+// Per AI Governance Framework §6.1: the secret must never appear in any log output.
+async function hmacSign(payload, secret) {
+  const body = JSON.stringify(payload);
+  // wix-crypto-backend returns a hex string directly
+  return hmac(body, secret);
+}
 
 // ─── postWithRetry ────────────────────────────────────────────────────────────
-async function postWithRetry(url, payload, requestId) {
+// FIX v1.0.1: accepts `signature` parameter and attaches it as X-HMAC-Signature
+// on every attempt. The n8n pipeline Stage 1 node validates this header and
+// rejects unsigned requests with HTTP 401.
+async function postWithRetry(url, payload, signature, requestId) {
   let lastError;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -31,8 +63,11 @@ async function postWithRetry(url, payload, requestId) {
 
       const response = await fetch(url, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(payload),
+        headers: {
+          'Content-Type':    'application/json',
+          'X-HMAC-Signature': signature,  // ← FIX: required by n8n Stage 1 HMAC check
+        },
+        body: JSON.stringify(payload),
       });
 
       if (response.ok) {
@@ -119,12 +154,16 @@ export const generateStoryboard = webMethod(
     }
 
     // ── 6. Retrieve secrets ──────────────────────────────────────────────────
-    let webhookUrl;
+    // FIX v1.0.1: retrieve both secrets in parallel.
+    // N8N_CALLBACK_SECRET_KEY is the shared HMAC secret — it must never be logged.
+    let webhookUrl, callbackSecretKey;
     try {
-      webhookUrl = await getSecret('N8N_STORYBOARD_WEBHOOK_URL');
+      [webhookUrl, callbackSecretKey] = await Promise.all([
+        getSecret('N8N_STORYBOARD_WEBHOOK_URL'),
+        getSecret('N8N_CALLBACK_SECRET_KEY'),
+      ]);
     } catch (err) {
       console.error(`${VERSION} [${requestId}] Secret retrieval failed: ${err.message}`);
-      // Roll back status before returning
       await wixData.update(COLLECTION, { ...project, storyboardStatus: 'failed' }).catch(() => {});
       return fail(500, 'CONFIG_ERROR', 'Pipeline configuration is unavailable. Please try again later.');
     }
@@ -146,14 +185,28 @@ export const generateStoryboard = webMethod(
       targetAudience:     project.targetAudience     ?? '',
     };
 
-    console.log(`${VERSION} [${requestId}] Payload assembled — dispatching to n8n`);
-
-    // ── 8. Fire-and-forget webhook dispatch ──────────────────────────────────
+    // ── 8. Compute HMAC-SHA256 signature ─────────────────────────────────────
+    // FIX v1.0.1: signature computed here once over the canonical payload.
+    // The same serialisation (JSON.stringify) is used in postWithRetry's fetch body
+    // and in the n8n Stage 1 validation node — they must match exactly.
+    // SECURITY: callbackSecretKey is never passed to console.log (AI Governance §6.1).
+    let signature;
     try {
-      await postWithRetry(webhookUrl, n8nPayload, requestId);
+      signature = await hmacSign(n8nPayload, callbackSecretKey);
+    } catch (err) {
+      console.error(`${VERSION} [${requestId}] HMAC signing failed: ${err.message}`);
+      await wixData.update(COLLECTION, { ...project, storyboardStatus: 'failed' }).catch(() => {});
+      return fail(500, 'SIGNING_ERROR', 'Failed to sign pipeline payload. Please try again.');
+    }
+
+    console.log(`${VERSION} [${requestId}] Payload signed — dispatching to n8n`);
+
+    // ── 9. Fire-and-forget webhook dispatch ──────────────────────────────────
+    // FIX v1.0.1: signature passed to postWithRetry and attached as X-HMAC-Signature header.
+    try {
+      await postWithRetry(webhookUrl, n8nPayload, signature, requestId);
     } catch (err) {
       console.error(`${VERSION} [${requestId}] All webhook attempts failed: ${err.message}`);
-      // Roll back — allow user retry
       await wixData.update(COLLECTION, { ...project, storyboardStatus: 'failed' }).catch(() => {});
       return fail(502, 'WEBHOOK_ERROR', 'Storyboard generation pipeline is unavailable. Please try again.');
     }

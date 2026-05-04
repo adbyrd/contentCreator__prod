@@ -647,6 +647,84 @@ export const getStoryboardFrames = webMethod(Permissions.Anyone, async (projectI
     }
 });
 
+// ─── CANCEL STORYBOARD ────────────────────────────────────────────────────────────────────
+
+/**
+ * [ CANCEL STORYBOARD : v1.0.0 ]
+ *
+ * Stamps a project's storyboardStatus as 'cancelled', persisting the
+ * cancellation across page refreshes.
+ *
+ * This is the missing half of the cancel flow. Without this write the
+ * status remains 'generating' in the database, so every page reload
+ * reads that status and auto-resumes polling — the bug this method fixes.
+ *
+ * Guards:
+ *   - Caller must be authenticated.
+ *   - Caller must own the project.
+ *   - Only projects currently in STATUS_GENERATING can be cancelled.
+ *     Calling this on a complete, failed, or already-cancelled project
+ *     is a no-op that returns ok: true (idempotent).
+ *
+ * This method does NOT cancel the n8n pipeline — frames may still arrive
+ * via receiveFrames() after cancellation. receiveFrames() does not check
+ * for 'cancelled' status before writing, so partial frames will be
+ * persisted. The frontend ignores them because the poller has stopped
+ * and the page will not resume polling on reload (status !== 'generating').
+ * This is acceptable for MVP — a future iteration can add n8n cancellation
+ * signalling if required.
+ *
+ * @param {string} projectId
+ * @returns {{ ok: boolean, status: number, error?: object }}
+ */
+export const cancelStoryboard = webMethod(Permissions.Anyone, async (projectId) => {
+    const requestId = `cs_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    console.log(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] cancelStoryboard() invoked — projectId: ${projectId}`);
+
+    try {
+        if (!projectId) {
+            console.warn(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] Missing projectId.`);
+            return { ok: false, status: 400, error: { type: 'MISSING_ID', message: 'Project ID is required.' } };
+        }
+
+        const { memberId } = await getAuthenticatedMember();
+        if (!memberId) {
+            console.warn(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] Unauthenticated attempt.`);
+            return { ok: false, status: 401, error: { type: 'AUTH_REQUIRED', message: 'Authentication required.' } };
+        }
+
+        const project = await wixData.get(COLLECTION_PROJECTS, projectId, DB_OPTIONS);
+        if (!project) {
+            console.warn(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] Project not found: ${projectId}`);
+            return { ok: false, status: 404, error: { type: 'NOT_FOUND', message: 'Project not found.' } };
+        }
+
+        if (project._owner !== memberId) {
+            console.warn(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] Ownership mismatch. Member: ${memberId}`);
+            return { ok: false, status: 403, error: { type: 'FORBIDDEN', message: 'You do not own this project.' } };
+        }
+
+        // Idempotent — if already cancelled (or complete/failed), no write needed.
+        if (project.storyboardStatus !== STATUS_GENERATING) {
+            console.log(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] Status is '${project.storyboardStatus}' — no write needed.`);
+            return { ok: true, status: 200, alreadySettled: true };
+        }
+
+        await wixData.update(COLLECTION_PROJECTS, {
+            ...project,
+            storyboardStatus:      'cancelled',
+            storyboardCancelledAt: new Date().toISOString()
+        }, DB_OPTIONS);
+
+        console.log(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] Project ${projectId} stamped cancelled.`);
+        return { ok: true, status: 200 };
+
+    } catch (err) {
+        console.error(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] cancelStoryboard failure:`, err);
+        return { ok: false, status: 500, error: { type: 'INTERNAL', message: err.message } };
+    }
+});
+
 // ─── DEBUG ────────────────────────────────────────────────────────────────────
 
 export function debugProjectService() {

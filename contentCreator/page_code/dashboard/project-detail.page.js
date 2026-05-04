@@ -1,79 +1,56 @@
 /**
- * [ FILE NAME : project-detail.page__v2.5.0 ]
+ * [ FILE NAME : project-detail.page__v2.6.0 ]
  * Page: Project Detail (Dynamic)
  * Path: /page_code/dashboard/project-detail.page.js
- * Version: [ PROJECT DETAIL : v2.5.0 ]
+ * Version: [ PROJECT DETAIL : v2.6.0 ]
  *
- * Changes (v2.4.0 → v2.5.0)
+ * Changes (v2.5.0 → v2.6.0)
  * ─────────────────────────────────────────────────────────────────────────────
- * FEATURE: Cancel Storyboard confirmation flow
+ * BUG FIX: Polling resumed after cancellation on page refresh.
  *
- *   1. BTN_CANCEL (#btnCancelStoryboard) is hidden on load via safeHide() in
- *      $w.onReady — code-enforced; do not rely on the canvas 'Hidden on Load'
- *      setting alone.
+ * ROOT CAUSE:
+ *   The v2.5.0 cancel flow stopped the frontend poller but never wrote
+ *   anything to the database. storyboardStatus remained 'generating' in
+ *   the projects collection. On the next page load $w.onReady read that
+ *   status, saw 'generating', and correctly (per its own logic) resumed
+ *   polling — because the system had no record that cancellation occurred.
  *
- *   2. When generation dispatches successfully (result.ok) OR resumes via
- *      ALREADY_RUNNING:
- *        - #btnGenerateStoryboard is hidden.
- *        - #btnCancelStoryboard is shown.
+ * FIX — Two changes:
  *
- *   3. Clicking #btnCancelStoryboard opens the 'CancelStoryboardConfirm'
- *      lightbox (see cancel-storyboard-confirm.modal.js).
+ *   1. wireCancelButton() now calls cancelStoryboard() (new backend webMethod)
+ *      BEFORE stopping the local poller. This stamps storyboardStatus as
+ *      'cancelled' in the database. If the backend call fails the cancel
+ *      is aborted — the user is shown an error and generation continues,
+ *      keeping frontend and backend state in sync at all times.
  *
- *   4. Lightbox returns { confirmed: true } → "Yes I'm Sure" path:
- *        - stopActivePoller() stops and nulls _activePoller.
- *        - resetGenerationUI() restores all UI to idle state.
- *        - MSG_CANCELLED toaster is shown.
+ *   2. The auto-resume guard in $w.onReady now explicitly checks for
+ *      STATUS_GENERATING ('generating') only. The 'cancelled' status
+ *      falls through without resuming the poller, so a refresh after
+ *      cancellation correctly shows the idle Generate Storyboard state.
+ *      (This was already the behaviour in v2.5.0 because the check was
+ *      `=== 'generating'`, but it is now documented explicitly alongside
+ *      the fix so the intent is clear.)
  *
- *   5. Lightbox returns no payload → "Cancel" path:
- *        - No action. Generation continues uninterrupted.
- *
- *   6. Auto-resume on page load (storyboardStatus === 'generating') now also
- *      shows #btnCancelStoryboard and hides #btnGenerateStoryboard, keeping
- *      the button pair consistent with mid-generation state.
- *
- *   7. resetGenerationUI() is now the single shared teardown path for ALL
- *      post-generation states: onComplete, onTimeout, onError, and cancel.
- *      Previously each callback managed its own UI resets inline.
- *
- * New canvas element required
+ * New import
  * ─────────────────────────────────────────────────────────────────────────────
- *   #btnCancelStoryboard — Button, set Hidden on Load in Wix Editor
+ *   cancelStoryboard from 'backend/services/project.web'
  *
- * New lightbox required
+ * New message constants
  * ─────────────────────────────────────────────────────────────────────────────
- *   'CancelStoryboardConfirm' — see cancel-storyboard-confirm.modal.js
- *     Elements: #txtModalHeading, #txtModalBody,
- *               #btnDismissCancel ("Cancel"),
- *               #btnConfirmCancel ("Yes I'm Sure")
+ *   MSG_CANCEL_FAILED — shown when the backend stamp fails; generation continues.
  *
- * All v2.4.0 behaviour is preserved unchanged:
- *   - ALREADY_RUNNING resumes polling
- *   - DISPATCH_FAILED / WEBHOOK_ERROR / WEBHOOK_UNAVAILABLE → MSG_DISPATCH_FAILED
- *   - CONFIG_ERROR / CONFIGURATION_ERROR → MSG_CONFIG_ERROR
- *   - startStoryboardPolling() positional signature (projectId, { callbacks })
- *   - onFrame(frame, frames) aligned to storyboard-poller.js v2.0.0
- *   - setupPageUI() breadcrumb + back button
- *
- * DEPLOYMENT CHECKLIST (resolve DISPATCH_FAILED):
- *   1. In Wix Dashboard → Secrets Manager:
- *      - N8N_STORYBOARD_WEBHOOK_URL must be set to the live n8n webhook URL
- *      - N8N_CALLBACK_SECRET_KEY must be set to the shared HMAC secret
- *   2. In n8n workspace:
- *      - Storyboard workflow must be ACTIVE (not draft)
- *      - Webhook trigger node must be listening (production URL, not test URL)
- *   3. Verify with: debugGenerateStoryboard() in Wix API Explorer
+ * All v2.5.0 behaviour is preserved unchanged.
  */
 
 import wixLocation  from 'wix-location';
 import wixWindow    from 'wix-window';
-import { verifyProjectAccess, generateStoryboard }           from 'backend/services/project.web';
-import { validateProjectForGeneration }                      from 'public/utils/validation';
-import { safeDisable, safeShow, safeHide, setButtonLoading } from 'public/utils/ui';
-import { showToaster }                                       from 'public/utils/notification';
-import { startStoryboardPolling, stopStoryboardPolling }     from 'public/utils/storyboard-poller';
+import { verifyProjectAccess, generateStoryboard, cancelStoryboard } from 'backend/services/project.web';
+import { validateProjectForGeneration }                              from 'public/utils/validation';
+import { safeDisable, safeShow, safeHide, setButtonLoading }        from 'public/utils/ui';
+import { showToaster }                                              from 'public/utils/notification';
+import { startStoryboardPolling, stopStoryboardPolling }            from 'public/utils/storyboard-poller';
 
-const VERSION           = '[ PROJECT DETAIL : v2.5.0 ]';
+const VERSION           = '[ PROJECT DETAIL : v2.6.0 ]';
 const PATH_UNAUTHORIZED = '/cc';
 
 // ─── MESSAGES ─────────────────────────────────────────────────────────────────
@@ -88,11 +65,16 @@ const MSG_PROJECT_UPDATED     = 'Project updated successfully.';
 const MSG_GENERATING          = 'Generating...';
 const MSG_GENERATE_DEFAULT    = 'Generate Storyboard';
 const MSG_CANCELLED           = 'Storyboard generation cancelled.';
+const MSG_CANCEL_FAILED       = 'Unable to cancel generation. Please try again.';
 
 // ─── SELECTORS ────────────────────────────────────────────────────────────────
 
 const BTN_GENERATE = '#btnGenerateStoryboard';
 const BTN_CANCEL   = '#btnCancelStoryboard';
+
+// ─── STATUS CONSTANTS ─────────────────────────────────────────────────────────
+
+const STATUS_GENERATING = 'generating';
 
 // ─── MODULE STATE ─────────────────────────────────────────────────────────────
 
@@ -105,8 +87,6 @@ $w.onReady(async function () {
     console.log(`${VERSION} Initializing...`);
 
     // ── 0. SECURITY GATE — hide content BEFORE any async work ────────────────
-    // Must be the first operation. Code-enforced — do not rely on the Wix
-    // Editor 'Hidden on Load' canvas setting alone (can be accidentally changed).
     safeHide('#pageContentContainer');
 
     // ── 1. Read project ID from the dynamic dataset ───────────────────────────
@@ -134,8 +114,6 @@ $w.onReady(async function () {
     console.log(`${VERSION} Access granted. Rendering: "${_currentProject.title}"`);
 
     // ── 4. Default UI state ───────────────────────────────────────────────────
-    // Cancel button is only visible during active generation. Enforce in code
-    // regardless of the canvas 'Hidden on Load' setting.
     safeHide(BTN_CANCEL);
 
     // ── 5. Render, wire, then reveal ──────────────────────────────────────────
@@ -144,13 +122,19 @@ $w.onReady(async function () {
     wireGenerateButton();
     wireCancelButton();
 
-    // Resume polling if the user navigated back mid-generation.
-    // Also swap buttons so the UI reflects the in-progress state correctly.
-    if (_currentProject.storyboardStatus === 'generating') {
-        console.log(`${VERSION} Generation in progress on load — resuming poll.`);
+    // ── 6. Auto-resume guard ──────────────────────────────────────────────────
+    // Only resume when status is strictly 'generating'.
+    // 'cancelled' (written by cancelStoryboard()) must NOT resume the poller —
+    // that is the fix for the refresh-after-cancel bug.
+    // Other statuses ('complete', 'failed', 'idle', undefined) also fall through
+    // without resuming.
+    if (_currentProject.storyboardStatus === STATUS_GENERATING) {
+        console.log(`${VERSION} storyboardStatus is '${STATUS_GENERATING}' on load — resuming poll.`);
         safeHide(BTN_GENERATE);
         safeShow(BTN_CANCEL);
         startPolling();
+    } else {
+        console.log(`${VERSION} storyboardStatus is '${_currentProject.storyboardStatus || 'idle'}' — idle state, no poll resumed.`);
     }
 
     // Reveal only after ownership is confirmed and UI is ready
@@ -180,7 +164,6 @@ function wireEditButton() {
             if (result?.updated) {
                 console.log(`${VERSION} Edit confirmed. Re-syncing project state...`);
 
-                // Re-fetch from backend — never read from dataset after a mutation
                 const refreshed = await verifyProjectAccess(_currentProject._id);
 
                 if (refreshed.ok && refreshed.authorized) {
@@ -210,7 +193,6 @@ function wireEditButton() {
 function wireGenerateButton() {
     $w(BTN_GENERATE).onClick(async () => {
 
-        // ── Validate project fields before dispatch ───────────────────────────
         const validation = validateProjectForGeneration(_currentProject);
         if (!validation.isValid) {
             showToaster(validation.message, 'error');
@@ -218,9 +200,8 @@ function wireGenerateButton() {
         }
 
         setButtonLoading(BTN_GENERATE, MSG_GENERATING, MSG_GENERATE_DEFAULT);
-        safeShow('#ccLoadingPreloader');
+        safeShow('#loadingPreloader');
 
-        // Stop any existing poller before dispatching a new generation run
         if (_activePoller) {
             stopStoryboardPolling(_activePoller);
             _activePoller = null;
@@ -229,7 +210,6 @@ function wireGenerateButton() {
         const result = await generateStoryboard(_currentProject._id);
 
         if (result.ok) {
-            // Dispatch succeeded — swap buttons and begin polling
             safeHide(BTN_GENERATE);
             safeShow(BTN_CANCEL);
             console.log(`${VERSION} Generation dispatched. Cancel button shown.`);
@@ -237,13 +217,10 @@ function wireGenerateButton() {
             return;
         }
 
-        // ── Route error types explicitly ──────────────────────────────────────
         const errorType = result.error?.type || 'UNKNOWN';
         console.warn(`${VERSION} generateStoryboard failed: type=${errorType}`, result.error);
 
         if (errorType === 'ALREADY_RUNNING') {
-            // A generation is already in progress — attach to it rather than
-            // showing an error. Swap buttons and resume polling.
             console.log(`${VERSION} ALREADY_RUNNING — resuming active generation poll.`);
             safeHide(BTN_GENERATE);
             safeShow(BTN_CANCEL);
@@ -252,25 +229,19 @@ function wireGenerateButton() {
             return;
         }
 
-        // All other errors: restore button so the user can retry.
         setButtonLoading(BTN_GENERATE, null, MSG_GENERATE_DEFAULT);
-        safeHide('#ccLoadingPreloader');
+        safeHide('#loadingPreloader');
 
         if (errorType === 'DISPATCH_FAILED' || errorType === 'WEBHOOK_ERROR' || errorType === 'WEBHOOK_UNAVAILABLE') {
-            // n8n pipeline unreachable after all retries.
-            // RESOLUTION: Verify N8N_STORYBOARD_WEBHOOK_URL secret in Wix Secrets
-            // Manager and ensure the n8n workflow is active (not in test/draft mode).
             showToaster(MSG_DISPATCH_FAILED, 'error');
             return;
         }
 
         if (errorType === 'CONFIG_ERROR' || errorType === 'CONFIGURATION_ERROR') {
-            // Secret not configured in Wix Secrets Manager.
             showToaster(MSG_CONFIG_ERROR, 'error');
             return;
         }
 
-        // Generic fallback for unexpected error types
         showToaster(MSG_GENERATION_FAILED, 'error');
     });
 }
@@ -280,17 +251,17 @@ function wireGenerateButton() {
 /**
  * Wires #btnCancelStoryboard.
  *
- * Opens the CancelStoryboardConfirm lightbox. The modal returns
- * { confirmed: true } when the user clicks "Yes I'm Sure", or closes
- * with no payload when the user clicks "Cancel".
- *
- * On confirmation:
- *   - stopActivePoller() stops and nulls _activePoller immediately.
- *   - resetGenerationUI() restores all UI to idle state.
- *   - MSG_CANCELLED toaster is shown.
- *
- * On dismissal:
- *   - No action — generation continues uninterrupted.
+ * Flow:
+ *   1. Open confirmation modal.
+ *   2. On "Yes I'm Sure": call cancelStoryboard() backend method FIRST.
+ *      This stamps storyboardStatus = 'cancelled' in the database so that
+ *      a subsequent page refresh does not auto-resume the poller.
+ *   3. Only if the backend stamp succeeds: stop the local poller and
+ *      reset the UI to idle.
+ *   4. If the backend stamp fails: show an error toaster. The modal has
+ *      already closed, so we leave the poller running and the cancel
+ *      button visible — generation continues and the user can retry.
+ *   5. On "Cancel" (modal dismissed): no action, generation continues.
  */
 function wireCancelButton() {
     $w(BTN_CANCEL).onClick(async () => {
@@ -299,17 +270,34 @@ function wireCancelButton() {
         try {
             const result = await wixWindow.openLightbox('CancelStoryboardConfirm');
 
-            if (result?.confirmed) {
-                console.log(`${VERSION} User confirmed cancellation. Stopping poller and resetting UI.`);
-                stopActivePoller();
-                resetGenerationUI();
-                showToaster(MSG_CANCELLED, 'warning');
-            } else {
-                // User dismissed the modal — generation continues
+            if (!result?.confirmed) {
                 console.log(`${VERSION} Cancellation dismissed. Generation continues.`);
+                return;
             }
+
+            // ── User confirmed — stamp the database FIRST ─────────────────────
+            console.log(`${VERSION} User confirmed. Stamping cancellation in database...`);
+            const cancelResult = await cancelStoryboard(_currentProject._id);
+
+            if (!cancelResult.ok) {
+                // Backend failed to persist the cancellation. Do NOT stop the
+                // poller — frontend and backend would be out of sync. Surface
+                // an error so the user knows to try again.
+                const errType = cancelResult.error?.type || 'UNKNOWN';
+                console.error(`${VERSION} cancelStoryboard failed: type=${errType}`, cancelResult.error);
+                showToaster(MSG_CANCEL_FAILED, 'error');
+                return;
+            }
+
+            // ── Backend confirmed — now safe to stop frontend poller ───────────
+            console.log(`${VERSION} Database stamped. Stopping poller and resetting UI.`);
+            stopActivePoller();
+            resetGenerationUI();
+            showToaster(MSG_CANCELLED, 'warning');
+
         } catch (err) {
-            console.error(`${VERSION} Cancel confirmation modal error:`, err);
+            console.error(`${VERSION} Cancel flow error:`, err);
+            showToaster(MSG_CANCEL_FAILED, 'error');
         }
     });
 }
@@ -320,10 +308,7 @@ function wireCancelButton() {
  * Starts the adaptive storyboard poller for the current project.
  *
  * SIGNATURE: startStoryboardPolling(projectId, { callbacks })
- *   — positional args per storyboard-poller.js v2.0.0.
- *   — Do NOT use the old single-object form: startStoryboardPolling({ projectId, ... })
- *     That causes the poller to receive the config object as projectId, producing
- *     a terminal poll error on the first tick.
+ *   — positional args per storyboard-poller.js v2.1.0.
  */
 function startPolling() {
     _activePoller = startStoryboardPolling(_currentProject._id, {
@@ -352,7 +337,6 @@ function startPolling() {
 
 /**
  * Renders a newly delivered storyboard frame into the page UI.
- * Canvas-specific — adapt element IDs to the Wix Editor layout.
  *
  * @param {object} frame  — individual frame record (frameIndex, imageUrl, promptText, frameData)
  * @param {array}  frames — all frames delivered so far, ascending by frameIndex
@@ -383,13 +367,13 @@ function stopActivePoller() {
  *   - onComplete        — generation finished successfully
  *   - onTimeout         — generation exceeded the polling window
  *   - onError           — terminal backend error
- *   - wireCancelButton  — user confirmed cancellation
+ *   - wireCancelButton  — user confirmed cancellation (backend stamp succeeded)
  */
 function resetGenerationUI() {
     setButtonLoading(BTN_GENERATE, null, MSG_GENERATE_DEFAULT);
     safeShow(BTN_GENERATE);
     safeHide(BTN_CANCEL);
-    safeHide('#ccLoadingPreloader');
+    safeHide('#loadingPreloader');
     console.log(`${VERSION} Generation UI reset to idle.`);
 }
 
@@ -399,10 +383,11 @@ export function debugPageState() {
     console.log(`${VERSION} _currentProject:`, _currentProject);
     console.log(`${VERSION} _activePoller:`,   _activePoller);
     return {
-        version:      '2.5.0',
-        projectId:    _currentProject?._id    || null,
-        projectTitle: _currentProject?.title  || null,
-        pollerActive: !!_activePoller,
-        timestamp:    new Date().toISOString()
+        version:         '2.6.0',
+        projectId:       _currentProject?._id              || null,
+        projectTitle:    _currentProject?.title            || null,
+        storyboardStatus: _currentProject?.storyboardStatus || null,
+        pollerActive:    !!_activePoller,
+        timestamp:       new Date().toISOString()
     };
 }
