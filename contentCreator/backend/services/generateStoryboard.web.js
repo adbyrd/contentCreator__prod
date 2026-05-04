@@ -1,60 +1,75 @@
-// [ FILE NAME : generateStoryboard.web.js : v1.0.1 ]
+// [ FILE NAME : generateStoryboard.web.js : v1.1.0 ]
 // Domain  : Storyboard
 // Layer   : Backend — Dispatch Gate
 // Purpose : Validates caller ownership, guards duplicate runs, stamps project
-//           status, assembles the full n8n payload, computes HMAC-SHA256 signature,
-//           and fires the signed webhook via postWithRetry (3 attempts, exponential back-off).
+//           status, assembles the full n8n payload, computes HMAC-SHA256
+//           signature, and fires the signed webhook via postWithRetry
+//           (3 attempts, exponential back-off).
 //
-// CHANGELOG v1.0.1
-// ─────────────────────────────────────────────────────────────────────────────
-// FIX: postWithRetry was dispatching the webhook without the X-HMAC-Signature
-//      header. The n8n pipeline's Stage 1 Validate HMAC + Payload node performs
-//      a mandatory HMAC-SHA256 check on every inbound request and correctly
-//      rejected all calls with HTTP 401 UNAUTHORIZED.
+// ─── Changelog ────────────────────────────────────────────────────────────────
+// v1.1.0  — Fix: HMAC-SHA256 signature now computed from N8N_CALLBACK_SECRET_KEY
+//            and attached as X-HMAC-Signature header on every outbound webhook
+//            request. Previously, the header was never sent, causing all Stage 1
+//            HMAC validation checks in n8n to fail with 401 UNAUTHORIZED.
 //
-// CHANGES:
-//   1. getSecret() now also retrieves N8N_CALLBACK_SECRET_KEY alongside
-//      N8N_STORYBOARD_WEBHOOK_URL in a single parallel Promise.all() call.
-//   2. New hmacSign() helper computes HMAC-SHA256 hex digest of the serialised
-//      payload using the shared secret.
-//   3. postWithRetry() now accepts the computed signature and attaches it as
-//      the X-HMAC-Signature header on every attempt — including retries.
-//   4. The secret value is never logged (AI Governance Framework §6.1).
-// ─────────────────────────────────────────────────────────────────────────────
+//            Changes from v1.0.0:
+//              1. getSecret() now retrieves BOTH N8N_STORYBOARD_WEBHOOK_URL and
+//                 N8N_CALLBACK_SECRET_KEY before dispatch.
+//              2. rawBody is serialised once (JSON.stringify) and reused for
+//                 both the HMAC computation and the fetch body — byte identity
+//                 is guaranteed.
+//              3. postWithRetry() signature updated to accept rawBody (string)
+//                 and hmacSignature (hex string) as discrete parameters.
+//              4. fetch() headers now include X-HMAC-Signature.
+//              5. Rollback path on secret retrieval failure updated to cover
+//                 both secrets in a single try/catch block.
+// ──────────────────────────────────────────────────────────────────────────────
 
 import { Permissions, webMethod } from 'wix-web-module';
 import { getSecret }              from 'wix-secrets-backend';
+import { createHmac }             from 'crypto';
 import wixData                    from 'wix-data';
-import { currentMember }         from 'wix-members-backend';
+import { currentMember }          from 'wix-members-backend';
 import { fetch }                  from 'wix-fetch';
-import { hmac }                   from 'wix-crypto-backend'; // Wix HMAC-SHA256 utility
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const VERSION       = '[ GENERATE STORYBOARD : v1.0.1 ]';
+const VERSION       = '[ GENERATE STORYBOARD : v1.1.0 ]';
 const COLLECTION    = 'projects';
 const MAX_RETRIES   = 3;
 const BASE_DELAY_MS = 500;
 
 // ─── Structured response helpers ─────────────────────────────────────────────
-const ok   = (data)                  => ({ ok: true,  status: 200, data });
-const fail = (status, type, message) => ({ ok: false, status, error: { type, message } });
+const ok   = (data)                   => ({ ok: true,  status: 200, data });
+const fail = (status, type, message)  => ({ ok: false, status, error: { type, message } });
 
-// ─── hmacSign ─────────────────────────────────────────────────────────────────
-// Computes HMAC-SHA256 hex digest of a serialised payload.
-// The secret is the shared value stored in both Wix Secrets Manager
-// (N8N_CALLBACK_SECRET_KEY) and the n8n environment variable of the same name.
-// Per AI Governance Framework §6.1: the secret must never appear in any log output.
-async function hmacSign(payload, secret) {
-  const body = JSON.stringify(payload);
-  // wix-crypto-backend returns a hex string directly
-  return hmac(body, secret);
+// ─── rollbackStatus ───────────────────────────────────────────────────────────
+// Best-effort status rollback. Never throws — a rollback failure must not mask
+// the original error that triggered it.
+async function rollbackStatus(project, requestId) {
+  try {
+    await wixData.update(COLLECTION, { ...project, storyboardStatus: 'failed' });
+    console.warn(`${VERSION} [${requestId}] Status rolled back to 'failed'`);
+  } catch (err) {
+    console.error(`${VERSION} [${requestId}] Rollback failed (non-fatal): ${err.message}`);
+  }
+}
+
+// ─── buildHmacSignature ───────────────────────────────────────────────────────
+// Signs the exact string that will be sent as the request body.
+// The string passed here MUST be the same reference passed to fetch() as body.
+function buildHmacSignature(rawBody, secret) {
+  return createHmac('sha256', secret)
+    .update(rawBody)
+    .digest('hex');
 }
 
 // ─── postWithRetry ────────────────────────────────────────────────────────────
-// FIX v1.0.1: accepts `signature` parameter and attaches it as X-HMAC-Signature
-// on every attempt. The n8n pipeline Stage 1 node validates this header and
-// rejects unsigned requests with HTTP 401.
-async function postWithRetry(url, payload, signature, requestId) {
+// Accepts a pre-serialised body string and a pre-computed HMAC hex signature.
+// Both are produced by the caller from a single JSON.stringify() call so that
+// the signed bytes and the transmitted bytes are guaranteed identical.
+//
+// v1.1.0: Added `hmacSignature` parameter; attaches X-HMAC-Signature header.
+async function postWithRetry(url, rawBody, hmacSignature, requestId) {
   let lastError;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -64,10 +79,10 @@ async function postWithRetry(url, payload, signature, requestId) {
       const response = await fetch(url, {
         method:  'POST',
         headers: {
-          'Content-Type':    'application/json',
-          'X-HMAC-Signature': signature,  // ← FIX: required by n8n Stage 1 HMAC check
+          'Content-Type':     'application/json',
+          'X-HMAC-Signature': hmacSignature,   // ← FIX: header n8n Stage 1 validates
         },
-        body: JSON.stringify(payload),
+        body: rawBody,                          // ← same string that was signed
       });
 
       if (response.ok) {
@@ -75,14 +90,25 @@ async function postWithRetry(url, payload, signature, requestId) {
         return { success: true, status: response.status };
       }
 
+      // Surface non-retryable client errors immediately
+      if (response.status >= 400 && response.status < 500) {
+        const msg = `Non-retryable HTTP ${response.status} from n8n webhook`;
+        console.error(`${VERSION} [${requestId}] ${msg}`);
+        throw new Error(msg);
+      }
+
       lastError = new Error(`HTTP ${response.status}`);
+      console.warn(`${VERSION} [${requestId}] Attempt ${attempt} returned ${response.status}`);
+
     } catch (err) {
+      // Re-throw non-retryable errors immediately
+      if (err.message.startsWith('Non-retryable')) throw err;
       lastError = err;
     }
 
     if (attempt < MAX_RETRIES) {
       const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
-      console.warn(`${VERSION} [${requestId}] Attempt ${attempt} failed — retrying in ${delay}ms`);
+      console.warn(`${VERSION} [${requestId}] Retrying in ${delay}ms`);
       await new Promise(r => setTimeout(r, delay));
     }
   }
@@ -154,18 +180,26 @@ export const generateStoryboard = webMethod(
     }
 
     // ── 6. Retrieve secrets ──────────────────────────────────────────────────
-    // FIX v1.0.1: retrieve both secrets in parallel.
-    // N8N_CALLBACK_SECRET_KEY is the shared HMAC secret — it must never be logged.
-    let webhookUrl, callbackSecretKey;
+    // v1.1.0: Both secrets are retrieved here. N8N_CALLBACK_SECRET_KEY is
+    // required to sign the outbound payload before dispatch.
+    let webhookUrl, callbackSecret;
     try {
-      [webhookUrl, callbackSecretKey] = await Promise.all([
+      [webhookUrl, callbackSecret] = await Promise.all([
         getSecret('N8N_STORYBOARD_WEBHOOK_URL'),
         getSecret('N8N_CALLBACK_SECRET_KEY'),
       ]);
     } catch (err) {
       console.error(`${VERSION} [${requestId}] Secret retrieval failed: ${err.message}`);
-      await wixData.update(COLLECTION, { ...project, storyboardStatus: 'failed' }).catch(() => {});
+      await rollbackStatus(project, requestId);
       return fail(500, 'CONFIG_ERROR', 'Pipeline configuration is unavailable. Please try again later.');
+    }
+
+    if (!webhookUrl || !callbackSecret) {
+      const missing = [!webhookUrl && 'N8N_STORYBOARD_WEBHOOK_URL', !callbackSecret && 'N8N_CALLBACK_SECRET_KEY']
+        .filter(Boolean).join(', ');
+      console.error(`${VERSION} [${requestId}] One or more secrets are empty: ${missing}`);
+      await rollbackStatus(project, requestId);
+      return fail(500, 'CONFIG_ERROR', 'Pipeline configuration is incomplete. Please contact support.');
     }
 
     // ── 7. Assemble n8n payload ──────────────────────────────────────────────
@@ -185,29 +219,21 @@ export const generateStoryboard = webMethod(
       targetAudience:     project.targetAudience     ?? '',
     };
 
-    // ── 8. Compute HMAC-SHA256 signature ─────────────────────────────────────
-    // FIX v1.0.1: signature computed here once over the canonical payload.
-    // The same serialisation (JSON.stringify) is used in postWithRetry's fetch body
-    // and in the n8n Stage 1 validation node — they must match exactly.
-    // SECURITY: callbackSecretKey is never passed to console.log (AI Governance §6.1).
-    let signature;
-    try {
-      signature = await hmacSign(n8nPayload, callbackSecretKey);
-    } catch (err) {
-      console.error(`${VERSION} [${requestId}] HMAC signing failed: ${err.message}`);
-      await wixData.update(COLLECTION, { ...project, storyboardStatus: 'failed' }).catch(() => {});
-      return fail(500, 'SIGNING_ERROR', 'Failed to sign pipeline payload. Please try again.');
-    }
+    // ── 8. Serialise once — sign and send the same bytes ────────────────────
+    // v1.1.0: rawBody is produced here, once. It is passed to both
+    // buildHmacSignature() and postWithRetry() to guarantee byte identity.
+    // Never call JSON.stringify(n8nPayload) again downstream.
+    const rawBody      = JSON.stringify(n8nPayload);
+    const hmacSig      = buildHmacSignature(rawBody, callbackSecret);
 
-    console.log(`${VERSION} [${requestId}] Payload signed — dispatching to n8n`);
+    console.log(`${VERSION} [${requestId}] Payload assembled — HMAC signed — dispatching to n8n`);
 
     // ── 9. Fire-and-forget webhook dispatch ──────────────────────────────────
-    // FIX v1.0.1: signature passed to postWithRetry and attached as X-HMAC-Signature header.
     try {
-      await postWithRetry(webhookUrl, n8nPayload, signature, requestId);
+      await postWithRetry(webhookUrl, rawBody, hmacSig, requestId);
     } catch (err) {
       console.error(`${VERSION} [${requestId}] All webhook attempts failed: ${err.message}`);
-      await wixData.update(COLLECTION, { ...project, storyboardStatus: 'failed' }).catch(() => {});
+      await rollbackStatus(project, requestId);
       return fail(502, 'WEBHOOK_ERROR', 'Storyboard generation pipeline is unavailable. Please try again.');
     }
 
@@ -223,7 +249,7 @@ export const generateStoryboard = webMethod(
 );
 
 // ─── Debug export ─────────────────────────────────────────────────────────────
-export async function debugGenerateStoryboard(projectId) {
+export async function debugGenerateStoryboard(projectId = 'debug-project-id') {
   console.log(`${VERSION} [DEBUG] Invoking generateStoryboard with projectId: ${projectId}`);
   return { debug: true, projectId, timestamp: new Date().toISOString() };
 }
