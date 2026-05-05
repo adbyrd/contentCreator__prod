@@ -44,7 +44,8 @@
 
 import wixLocation  from 'wix-location';
 import wixWindow    from 'wix-window';
-import { verifyProjectAccess, generateStoryboard, cancelStoryboard } from 'backend/services/project.web';
+import { verifyProjectAccess, cancelStoryboard } from 'backend/services/project.web';
+import { generateStoryboard }                    from 'backend/services/generateStoryboard.web';
 import { validateProjectForGeneration }                              from 'public/utils/validation';
 import { safeDisable, safeShow, safeHide, setButtonLoading }        from 'public/utils/ui';
 import { showToaster }                                              from 'public/utils/notification';
