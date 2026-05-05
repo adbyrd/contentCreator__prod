@@ -118,7 +118,7 @@ async function postWithRetry(url, rawBody, hmacSignature, requestId) {
 
 // ─── generateStoryboard ───────────────────────────────────────────────────────
 export const generateStoryboard = webMethod(
-  Permissions.Member,
+  Permissions.SiteMember,
   async (projectId) => {
     const requestId = `gs_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     console.log(`${VERSION} [${requestId}] generateStoryboard() invoked — projectId: ${projectId}`);

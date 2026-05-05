@@ -1,12 +1,10 @@
 /**
  * HMAC Validation
- * @version 1.0.1
+ * @version 1.1.0
  **/
 
-console.log("[ DEBUG ] Raw input keys:", JSON.stringify(Object.keys($input.item.json)));
-console.log("[ DEBUG ] Headers object:", JSON.stringify($input.item.json.headers ?? "NO_HEADERS_KEY"));
-
 const crypto = require("crypto");
+const body    = $input.item.json.body    ?? $input.item.json;
 const headers = $input.item.json.headers ?? {};
 const receivedSig = headers["x-hmac-signature"] ?? headers["X-HMAC-Signature"] ?? "";
 
@@ -20,7 +18,7 @@ if (!receivedSig) {
   }));
 }
 
-const secret      = $env.N8N_CALLBACK_SECRET_KEY;
+const secret      = $vars.N8N_CALLBACK_SECRET_KEY;  // ← $vars per previous fix
 const rawBody     = JSON.stringify(body);
 const expectedSig = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
 const buf1     = Buffer.from(receivedSig, "hex");
@@ -37,11 +35,7 @@ if (!sigValid) {
   }));
 }
 
-const REQUIRED = [
-  "projectId", "owner", "companyName", "companyDescription",
-  "primaryCategory", "customerType", "title", "goal",
-  "offer", "misconception", "targetAudience"
-];
+const REQUIRED = ["projectId", "owner", "companyName", "companyDescription","primaryCategory", "customerType", "title", "goal","offer", "misconception", "targetAudience"];
 
 const missing = REQUIRED.filter(function(f) { return !body[f] && body[f] !== 0; });
 
@@ -54,29 +48,3 @@ if (missing.length > 0) {
     meta: { component: "WEBHOOK TRIGGER", version: "v1.0.0", missingFields: missing }
   }));
 }
-
-const requestId   = "req_" + body.projectId + "_" + Date.now();
-const maskedOwner = body.owner.substring(0, 6) + "****";
-
-console.log("[ WEBHOOK TRIGGER : v1.0.0 ] HMAC_VALIDATED | requestId: " + requestId + " | projectId: " + body.projectId + " | owner: " + maskedOwner + " | timestamp: " + new Date().toISOString());
-console.log("[ WEBHOOK TRIGGER : v1.0.0 ] PAYLOAD_VALID | requestId: " + requestId + " | projectId: " + body.projectId + " | allFields: confirmed");
-console.log("[ WEBHOOK TRIGGER : v1.0.0 ] HANDOFF_SUCCESS | requestId: " + requestId + " | projectId: " + body.projectId + " | nextStage: prompt-generation");
-
-return [{
-  json: {
-    projectId:          body.projectId,
-    owner:              body.owner,
-    companyName:        body.companyName,
-    companyDescription: body.companyDescription,
-    primaryCategory:    body.primaryCategory,
-    customerType:       body.customerType,
-    title:              body.title,
-    goal:               body.goal,
-    offer:              body.offer,
-    misconception:      body.misconception,
-    targetAudience:     body.targetAudience,
-    requestId:          requestId,
-    pipelineVersion:    "v1.0.0",
-    stage1CompletedAt:  new Date().toISOString()
-  }
-}];
