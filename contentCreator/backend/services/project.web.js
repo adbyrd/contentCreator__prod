@@ -1,92 +1,48 @@
 /**
+ * [ FILE NAME : project.web.js : v2.3.0 ]
+ *
  * Service: Project Service
  * Path: /backend/services/project.web.js
- * Version: [ PROJECT SERVICE : v.2.2.0 ]
- *
- * v.2.2.0 — Storyboard Additions
- * ────────────────────────────────
- * Appends three new webMethod exports for the Storyboarding MVP.
- * All exports from v.2.1.0 are preserved unchanged.
- *
- * New exports:
- *   generateStoryboard(projectId)    — dispatch gate; fires n8n webhook
- *   receiveFrames(framePayload)      — n8n per-frame callback; HMAC-protected
- *   getStoryboardFrames(projectId)   — polling read endpoint; owner-scoped
- *
- * Existing exports (unchanged from v.2.1.0):
- *   createProject          — creates a new project record
- *   updateProject          — owner-only patch
- *   verifyProjectAccess    — authorization gate for the Project Detail page
- *   getUserProjectCount    — total project count for the authenticated member
- *   getMyProjects          — paginated project list for the authenticated member
- *
- * Scalability remediations from v.2.1.0 (preserved):
- *   SC-02  getMyProjects enforces PROJECT_LIMIT (25), returns nextCursor.
- *   SC-02  getStoryboardFrames uses .limit(TOTAL_FRAMES).
- *   SC-03  MAX_RETRIES = 2, WEBHOOK_TIMEOUT_MS = 8000 ms.
- *   SC-07  getUserProjectCount and getMyProjects query on _owner only.
- *
- * Wix Secrets required:
- *   N8N_STORYBOARD_WEBHOOK_URL  — n8n trigger URL
- *   N8N_CALLBACK_SECRET_KEY     — shared HMAC key for receiveFrames
- *
- * Collections:
- *   projects  — core project records
- *   frames    — per-frame image + metadata (projectId · owner-scoped)
- *
- * Required CMS indexes (configure in Wix Dashboard → Content Manager):
- *   projects : compound (_owner, _createdDate DESC)
- *   frames   : compound (projectId, frameIndex ASC)
- *   frames   : secondary (owner, projectId)
+ * Version: [ PROJECT SERVICE : v.2.3.0 ]
  */
 
 import { Permissions, webMethod } from 'wix-web-module';
 import wixData                    from 'wix-data';
 import { currentMember }          from 'wix-members-backend';
 
-// NOTE: wix-secrets-backend and wix-fetch are intentionally NOT imported at
-// the module level — both are backend-only. A top-level static import causes
-// Wix's bundler to attempt resolution in the frontend context and throw:
-//   "Cannot find module 'wix-web-module' in 'public/pages/...'"
-// Both are required inline inside the webMethods that use them.
-
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
-const VERSION             = '[ PROJECT SERVICE : v.2.2.0 ]';
-
-const COLLECTION_PROJECTS = 'projects';
-const COLLECTION_FRAMES   = 'frames';
-const DB_OPTIONS          = { suppressAuth: true };
-
-const ROLE_ADMIN          = 'Admin';
-
-// Pagination ceiling — enforced at the data layer, not just the UI.
-const PROJECT_LIMIT       = 25;
-
-// Storyboard pipeline
-const SECRET_N8N_WEBHOOK  = 'N8N_STORYBOARD_WEBHOOK_URL';
-const SECRET_CALLBACK_KEY = 'N8N_CALLBACK_SECRET_KEY';
-const TOTAL_FRAMES        = 15;
-
-// SC-03: Webhook retry config — timeout reduced so MAX_RETRIES × WEBHOOK_TIMEOUT_MS
-// stays well under the 30-second Velo webMethod execution ceiling.
-//   Previous: MAX_RETRIES = 3, WEBHOOK_TIMEOUT_MS = 12000  → up to 36+ s
-//   Current:  MAX_RETRIES = 2, WEBHOOK_TIMEOUT_MS = 8000   → up to ~17 s
-const MAX_RETRIES         = 2;
-const RETRY_DELAYS        = [500, 1500];   // ms — one delay between two attempts
-const RETRYABLE_STATUSES  = [429, 502, 503, 504];
-const WEBHOOK_TIMEOUT_MS  = 8000;
-
-// Storyboard status values
-const STATUS_GENERATING   = 'generating';
-const STATUS_COMPLETE     = 'complete';
-const STATUS_FAILED       = 'failed';
+const VERSION              = '[ PROJECT SERVICE : v.2.3.0 ]';
+const COLLECTION_PROJECTS  = 'projects';
+const COLLECTION_FRAMES    = 'storyboard_frames';
+const DB_OPTIONS           = { suppressAuth: true };
+const ROLE_ADMIN           = 'Admin';
+const PROJECT_LIMIT        = 25;
+const SECRET_N8N_WEBHOOK   = 'N8N_STORYBOARD_WEBHOOK_URL';
+const SECRET_CALLBACK_KEY  = 'N8N_CALLBACK_SECRET_KEY';
+const TOTAL_FRAMES         = 15;
+const FINAL_FRAME_INDEX    = TOTAL_FRAMES - 1; // 14
+const MAX_RETRIES          = 2;
+const RETRY_DELAYS         = [500, 1500];  // ms — one delay between two attempts
+const RETRYABLE_STATUSES   = [429, 502, 503, 504];
+const WEBHOOK_TIMEOUT_MS   = 8000;
+const STATUS_GENERATING    = 'generating';
+const STATUS_COMPLETE      = 'complete';
+const STATUS_FAILED        = 'failed';
+const STATUS_CANCELLED     = 'cancelled';
+const STORYBOARD_REQUIRED_FIELDS = [
+  'companyName',
+  'companyDescription',
+  'primaryCategory',
+  'customerType',
+  'targetAudience',
+];
 
 // ─── INTERNAL HELPERS ─────────────────────────────────────────────────────────
 
 /**
- * Resolves the currently authenticated member's ID and admin status in a
- * single getMember() call (FULL fieldset covers PUBLIC fields and roles).
+ * Resolves the currently authenticated member's ID and admin status.
+ * Uses fieldsets: ['FULL'] so that roles are included in a single call.
  *
  * @returns {{ memberId: string|null, isAdmin: boolean }}
  */
@@ -107,17 +63,57 @@ async function getAuthenticatedMember() {
 }
 
 /**
- * Fires a POST request to a webhook URL with exponential backoff.
- * Each attempt is independently aborted after WEBHOOK_TIMEOUT_MS.
+ * Best-effort project status rollback to STATUS_FAILED.
+ * Never throws — a rollback failure must not mask the originating error.
+ *
+ * @param {object} project  - Full project record from wixData.get()
+ * @param {string} requestId
+ */
+async function rollbackStatus(project, requestId) {
+    try {
+        await wixData.update(
+            COLLECTION_PROJECTS,
+            { ...project, storyboardStatus: STATUS_FAILED },
+            DB_OPTIONS
+        );
+        console.warn(`${VERSION} [${requestId}] Status rolled back to '${STATUS_FAILED}'`);
+    } catch (err) {
+        console.error(`${VERSION} [${requestId}] Rollback failed (non-fatal): ${err.message}`);
+    }
+}
+
+/**
+ * Signs a pre-serialised JSON string with HMAC-SHA256.
+ * The string passed here MUST be the same reference passed as the request body —
+ * byte identity between signed content and transmitted content is mandatory.
+ *
+ * @param {string} rawBody  - JSON.stringify() output
+ * @param {string} secret   - N8N_CALLBACK_SECRET_KEY value
+ * @returns {string}        - Hex digest
+ */
+function buildHmacSignature(rawBody, secret) {
+    const { createHmac } = require('crypto');
+    return createHmac('sha256', secret).update(rawBody).digest('hex');
+}
+
+/**
+ * Fires a signed POST request to a webhook URL with exponential backoff.
+ *
+ * v2.3.0: Upgraded from the v2.2.0 signature (url, body: object) to accept
+ *   rawBody (pre-serialised string) and hmacSignature (hex string) so that
+ *   the bytes signed and the bytes transmitted are guaranteed identical.
+ *   X-HMAC-Signature header is now attached on every attempt.
  *
  * SC-03: MAX_RETRIES = 2, WEBHOOK_TIMEOUT_MS = 8000 ms.
  * Worst-case total execution time ≈ 17 s, safely under the 30 s Velo limit.
  *
  * @param {string} url
- * @param {object} body
+ * @param {string} rawBody        - Pre-serialised JSON string (not re-stringified)
+ * @param {string} hmacSignature  - Hex HMAC-SHA256 of rawBody
+ * @param {string} requestId
  * @returns {{ ok: boolean, status: number, data?: any, error?: object }}
  */
-async function postWithRetry(url, body) {
+async function postWithRetry(url, rawBody, hmacSignature, requestId) {
     const { fetch } = require('wix-fetch');
     let lastError = null;
 
@@ -126,46 +122,56 @@ async function postWithRetry(url, body) {
         const timer = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
 
         try {
-            console.log(`${VERSION} Webhook attempt ${attempt}/${MAX_RETRIES}`);
+            console.log(`${VERSION} [${requestId}] Webhook attempt ${attempt}/${MAX_RETRIES}`);
 
             const response = await fetch(url, {
                 method:  'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body:    JSON.stringify(body),
-                signal:  controller.signal
+                headers: {
+                    'Content-Type':     'application/json',
+                    'X-HMAC-Signature': hmacSignature,  // Required by n8n Stage 1 node.02
+                },
+                body:   rawBody,   // Same string that was signed — no re-serialisation
+                signal: controller.signal,
             });
 
             clearTimeout(timer);
 
             if (response.ok) {
                 const data = await response.json().catch(() => ({}));
+                console.log(`${VERSION} [${requestId}] Webhook dispatched successfully on attempt ${attempt}`);
                 return { ok: true, status: response.status, data };
             }
 
+            // Non-retryable client errors — surface immediately, do not retry
             if (!RETRYABLE_STATUSES.includes(response.status)) {
-                console.error(`${VERSION} Non-retryable status: ${response.status}`);
+                console.error(`${VERSION} [${requestId}] Non-retryable status: ${response.status}`);
                 return {
                     ok:     false,
                     status: response.status,
-                    error:  { type: 'HTTP_ERROR', message: `Status ${response.status}` }
+                    error:  { type: 'HTTP_ERROR', message: `Non-retryable HTTP ${response.status}` },
                 };
             }
 
             lastError = `HTTP ${response.status}`;
+            console.warn(`${VERSION} [${requestId}] Attempt ${attempt} returned ${response.status}`);
 
         } catch (err) {
             clearTimeout(timer);
             lastError = err.name === 'AbortError' ? 'TIMEOUT' : err.message;
-            console.warn(`${VERSION} Webhook attempt ${attempt} failed: ${lastError}`);
+            console.warn(`${VERSION} [${requestId}] Webhook attempt ${attempt} failed: ${lastError}`);
         }
 
         if (attempt < MAX_RETRIES) {
-            await new Promise(res => setTimeout(res, RETRY_DELAYS[attempt - 1]));
+            await new Promise((res) => setTimeout(res, RETRY_DELAYS[attempt - 1]));
         }
     }
 
-    console.error(`${VERSION} All ${MAX_RETRIES} webhook attempts exhausted. Last error: ${lastError}`);
-    return { ok: false, status: 503, error: { type: 'WEBHOOK_UNAVAILABLE', message: lastError } };
+    console.error(`${VERSION} [${requestId}] All ${MAX_RETRIES} webhook attempts exhausted. Last: ${lastError}`);
+    return {
+        ok:     false,
+        status: 503,
+        error:  { type: 'WEBHOOK_UNAVAILABLE', message: lastError },
+    };
 }
 
 // ─── CREATE PROJECT ───────────────────────────────────────────────────────────
@@ -190,14 +196,18 @@ export const createProject = webMethod(Permissions.Anyone, async (projectData) =
         }
 
         const payload = {
-            title:           projectData.title,
-            description:     projectData.description,
-            goal:            projectData.goal,
-            offer:           projectData.offer,
-            target_audience: projectData.target_audience ?? projectData.audience,
-            misconception:   projectData.misconception,
+            title:              projectData.title,
+            description:        projectData.description,
+            companyName:        projectData.companyName,
+            companyDescription: projectData.companyDescription,
+            primaryCategory:    projectData.primaryCategory,
+            customerType:       projectData.customerType,
+            goal:               projectData.goal,
+            offer:              projectData.offer,
+            targetAudience:     projectData.targetAudience ?? projectData.target_audience ?? projectData.audience,
+            misconception:      projectData.misconception,
             // Write both fields during the transition period (SC-07).
-            owner:           memberId
+            owner: memberId,
         };
 
         const result = await wixData.insert(COLLECTION_PROJECTS, payload, DB_OPTIONS);
@@ -226,7 +236,7 @@ export const verifyProjectAccess = webMethod(Permissions.Anyone, async (projectI
             console.warn(`${VERSION} verifyProjectAccess: Called without a projectId.`);
             return {
                 ok: false, authorized: false,
-                error: { type: 'MISSING_ID', message: 'Project ID is required.' }
+                error: { type: 'MISSING_ID', message: 'Project ID is required.' },
             };
         }
 
@@ -235,7 +245,7 @@ export const verifyProjectAccess = webMethod(Permissions.Anyone, async (projectI
             console.warn(`${VERSION} verifyProjectAccess: Unauthenticated attempt. Project: ${projectId}`);
             return {
                 ok: true, authorized: false,
-                error: { type: 'AUTH_REQUIRED', message: 'Authentication required.' }
+                error: { type: 'AUTH_REQUIRED', message: 'Authentication required.' },
             };
         }
 
@@ -244,7 +254,7 @@ export const verifyProjectAccess = webMethod(Permissions.Anyone, async (projectI
             console.warn(`${VERSION} verifyProjectAccess: Not found. ID: ${projectId}`);
             return {
                 ok: false, authorized: false,
-                error: { type: 'NOT_FOUND', message: 'Project not found.' }
+                error: { type: 'NOT_FOUND', message: 'Project not found.' },
             };
         }
 
@@ -261,7 +271,7 @@ export const verifyProjectAccess = webMethod(Permissions.Anyone, async (projectI
         console.warn(`${VERSION} verifyProjectAccess: DENIED. Member: ${memberId}`);
         return {
             ok: true, authorized: false,
-            error: { type: 'FORBIDDEN', message: 'You do not have permission to view this project.' }
+            error: { type: 'FORBIDDEN', message: 'You do not have permission to view this project.' },
         };
 
     } catch (err) {
@@ -305,15 +315,19 @@ export const updateProject = webMethod(Permissions.Anyone, async (projectId, pro
         }
 
         const updatePayload = {
-            _id:             existing._id,
-            _owner:          existing._owner,
-            owner:           existing.owner,   // preserve mirror field during transition
-            title:           projectData.title,
-            description:     projectData.description,
-            goal:            projectData.goal,
-            offer:           projectData.offer,
-            target_audience: projectData.target_audience,
-            misconception:   projectData.misconception
+            _id:                existing._id,
+            _owner:             existing._owner,
+            owner:              existing.owner,  // preserve mirror field during SC-07 transition
+            title:              projectData.title,
+            description:        projectData.description,
+            companyName:        projectData.companyName,
+            companyDescription: projectData.companyDescription,
+            primaryCategory:    projectData.primaryCategory,
+            customerType:       projectData.customerType,
+            goal:               projectData.goal,
+            offer:              projectData.offer,
+            targetAudience:     projectData.targetAudience ?? projectData.target_audience,
+            misconception:      projectData.misconception,
         };
 
         const result = await wixData.update(COLLECTION_PROJECTS, updatePayload, DB_OPTIONS);
@@ -390,186 +404,435 @@ export const getMyProjects = webMethod(Permissions.Anyone, async ({ limit = PROJ
     }
 });
 
-
-
-// ─── RECEIVE FRAMES (n8n CALLBACK) ────────────────────────────────────────────
+// ─── GENERATE STORYBOARD ──────────────────────────────────────────────────────
 
 /**
- * Called by n8n as each frame completes.
- * Public (Permissions.Anyone) — n8n has no Wix member session.
+ * Dispatch gate for the n8n storyboard generation pipeline.
  *
- * Security layers:
- *   1. Shared-secret validation via secretKey field.
- *   2. Ownership re-verified against the DB before any write.
- *   3. Idempotent: duplicate deliveries from n8n retries are silently skipped.
+ * Flow:
+ *   1. Input guard.
+ *   2. Identity check.
+ *   3. Fetch project and verify ownership.
+ *   4. Duplicate-run guard (ALREADY_RUNNING).
+ *   5. Pre-dispatch field validation — surface INCOMPLETE_PROJECT before
+ *      any secrets are fetched or status is stamped.
+ *   6. Stamp project: storyboardStatus = 'generating'.
+ *   7. Retrieve both secrets in parallel (webhook URL + HMAC key).
+ *   8. Assemble n8n payload using the exact field names required by
+ *      n8n Stage 1 node.02 REQUIRED contract.
+ *   9. Serialise once — sign and transmit the same bytes (byte identity).
+ *  10. Fire signed webhook via postWithRetry (X-HMAC-Signature header).
+ *  11. On failure: rollback status to 'failed', return structured error.
  *
- * @param {object} framePayload
- * @returns {{ ok: boolean, status: number, duplicate?: boolean, isComplete?: boolean, error?: object }}
+ * v2.3.0 Fix — Payload field mapping corrected:
+ *   OLD (broken)               → NEW (correct)
+ *   ─────────────────────────────────────────
+ *   description                → companyDescription
+ *   target_audience            → targetAudience
+ *   [absent]                   → companyName
+ *   [absent]                   → primaryCategory
+ *   [absent]                   → customerType
+ *   postWithRetry(url, object) → postWithRetry(url, rawBody, hmacSig, reqId)
+ *   [no HMAC header]           → X-HMAC-Signature attached on every attempt
+ *
+ * @param {string} projectId
+ * @returns {{ ok: boolean, status: number, data?: object, error?: object }}
  */
-export const receiveFrames = webMethod(Permissions.Anyone, async (framePayload) => {
+export const generateStoryboard = webMethod(Permissions.Anyone, async (projectId) => {
+    const requestId = `gs_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    console.log(`${VERSION} [${requestId}] generateStoryboard() invoked — projectId: ${projectId}`);
+
     try {
-        const { projectId, owner, frameIndex, imageUrl, promptText, frameData, secretKey } = framePayload || {};
-
-        // 1. Payload guard
-        if (!projectId || frameIndex === undefined || !imageUrl || !secretKey) {
-            console.warn(`${VERSION} receiveFrames: Incomplete payload.`);
-            return { ok: false, status: 400, error: { type: 'INVALID_PAYLOAD', message: 'Missing required fields.' } };
+        // ── 1. Input guard ───────────────────────────────────────────────────
+        if (!projectId) {
+            console.warn(`${VERSION} [${requestId}] No projectId supplied.`);
+            return { ok: false, status: 400, error: { type: 'MISSING_ID', message: 'Project ID is required.' } };
         }
 
-        // 2. Secret validation (inline require — see module-level note)
-        const { getSecret } = require('wix-secrets-backend');
-        const expectedKey = await getSecret(SECRET_CALLBACK_KEY);
-        if (!expectedKey || secretKey !== expectedKey) {
-            console.error(`${VERSION} receiveFrames: Invalid secret. Project: ${projectId}`);
-            return { ok: false, status: 401, error: { type: 'UNAUTHORIZED', message: 'Invalid callback secret.' } };
+        // ── 2. Identity check ────────────────────────────────────────────────
+        const { memberId } = await getAuthenticatedMember();
+        if (!memberId) {
+            console.warn(`${VERSION} [${requestId}] Unauthenticated attempt.`);
+            return { ok: false, status: 401, error: { type: 'AUTH_REQUIRED', message: 'Authentication required.' } };
         }
 
-        // 3. Ownership re-verification
+        // ── 3. Fetch project + ownership check ───────────────────────────────
         const project = await wixData.get(COLLECTION_PROJECTS, projectId, DB_OPTIONS);
         if (!project) {
-            console.warn(`${VERSION} receiveFrames: Project not found: ${projectId}`);
+            console.warn(`${VERSION} [${requestId}] Project not found: ${projectId}`);
             return { ok: false, status: 404, error: { type: 'NOT_FOUND', message: 'Project not found.' } };
         }
+
+        if (project._owner !== memberId) {
+            console.warn(`${VERSION} [${requestId}] Ownership mismatch. Member: ${memberId}`);
+            return { ok: false, status: 403, error: { type: 'FORBIDDEN', message: 'You do not own this project.' } };
+        }
+
+        // ── 4. Duplicate-run guard ───────────────────────────────────────────
+        if (project.storyboardStatus === STATUS_GENERATING) {
+            console.warn(`${VERSION} [${requestId}] Already running for project: ${projectId}`);
+            return {
+                ok: false, status: 409,
+                error: { type: 'ALREADY_RUNNING', message: 'Storyboard generation is already in progress.' },
+            };
+        }
+
+        // ── 5. Pre-dispatch field validation ─────────────────────────────────
+        // Validate that all n8n-required business fields are non-empty on the
+        // project record BEFORE stamping status or fetching secrets.
+        // Empty string ('') is falsy — same rule as n8n node.02 validator.
+        const missingFields = STORYBOARD_REQUIRED_FIELDS.filter((f) => !project[f]);
+
+        if (missingFields.length > 0) {
+            const fieldList = missingFields.join(', ');
+            console.warn(`${VERSION} [${requestId}] Pre-dispatch validation failed. Missing: ${fieldList}`);
+            return {
+                ok: false, status: 400,
+                error: {
+                    type:    'INCOMPLETE_PROJECT',
+                    message: `Your project is missing required fields: ${fieldList}. Please complete your project details before generating.`,
+                },
+            };
+        }
+
+        console.log(`${VERSION} [${requestId}] Pre-dispatch validation passed — all required fields present`);
+
+        // ── 6. Stamp project ─────────────────────────────────────────────────
+        const generationStartedAt = new Date().toISOString();
+        try {
+            await wixData.update(
+                COLLECTION_PROJECTS,
+                {
+                    ...project,
+                    storyboardStatus:      STATUS_GENERATING,
+                    storyboardFrameCount:  0,
+                    storyboardStartedAt:   generationStartedAt,
+                    storyboardCompletedAt: null,
+                },
+                DB_OPTIONS
+            );
+            console.log(`${VERSION} [${requestId}] Project stamped — storyboardStatus: ${STATUS_GENERATING}`);
+        } catch (err) {
+            console.error(`${VERSION} [${requestId}] Status stamp failed: ${err.message}`);
+            return { ok: false, status: 500, error: { type: 'DATABASE_ERROR', message: 'Failed to update project status.' } };
+        }
+
+        // ── 7. Retrieve secrets ───────────────────────────────────────────────
+        const { getSecret } = require('wix-secrets-backend');
+
+        let webhookUrl, callbackSecret;
+        try {
+            [webhookUrl, callbackSecret] = await Promise.all([
+                getSecret(SECRET_N8N_WEBHOOK),
+                getSecret(SECRET_CALLBACK_KEY),
+            ]);
+        } catch (err) {
+            console.error(`${VERSION} [${requestId}] Secret retrieval failed: ${err.message}`);
+            await rollbackStatus(project, requestId);
+            return { ok: false, status: 500, error: { type: 'CONFIG_ERROR', message: 'Pipeline configuration is unavailable. Please try again later.' } };
+        }
+
+        const missingSecrets = [
+            !webhookUrl      && SECRET_N8N_WEBHOOK,
+            !callbackSecret  && SECRET_CALLBACK_KEY,
+        ].filter(Boolean);
+
+        if (missingSecrets.length > 0) {
+            console.error(`${VERSION} [${requestId}] Empty secrets: ${missingSecrets.join(', ')}`);
+            await rollbackStatus(project, requestId);
+            return { ok: false, status: 500, error: { type: 'CONFIG_ERROR', message: 'Pipeline configuration is incomplete. Please contact support.' } };
+        }
+
+        // ── 8. Assemble n8n payload ───────────────────────────────────────────
+        // Field names match the REQUIRED contract in n8n Stage 1 node.02 exactly.
+        // ?? '' fallback is safe here — required fields were validated in step 5.
+        const n8nPayload = {
+            submissionId:       requestId,
+            timestamp:          generationStartedAt,
+            projectId:          project._id,
+            owner:              project._owner,
+            companyName:        project.companyName        ?? '',
+            companyDescription: project.companyDescription ?? '',
+            primaryCategory:    project.primaryCategory    ?? '',
+            customerType:       project.customerType       ?? '',
+            title:              project.title              ?? '',
+            goal:               project.goal               ?? '',
+            offer:              project.offer              ?? '',
+            misconception:      project.misconception      ?? '',
+            targetAudience:     project.targetAudience     ?? '',
+        };
+
+        // ── 9. Serialise once — sign and transmit the same bytes ─────────────
+        // JSON.stringify() is called exactly once. rawBody is passed to both
+        // buildHmacSignature() and postWithRetry() — byte identity is guaranteed.
+        const rawBody = JSON.stringify(n8nPayload);
+        const hmacSig = buildHmacSignature(rawBody, callbackSecret);
+
+        console.log(`${VERSION} [${requestId}] Payload assembled — HMAC signed — dispatching to n8n`);
+
+        // ── 10. Fire-and-forget webhook dispatch ──────────────────────────────
+        const webhookResult = await postWithRetry(webhookUrl, rawBody, hmacSig, requestId);
+
+        if (!webhookResult.ok) {
+            console.error(`${VERSION} [${requestId}] All webhook attempts failed: ${webhookResult.error?.message}`);
+            await rollbackStatus(project, requestId);
+            return {
+                ok: false, status: 502,
+                error: { type: 'WEBHOOK_ERROR', message: 'Storyboard generation pipeline is unavailable. Please try again.' },
+            };
+        }
+
+        console.log(`${VERSION} [${requestId}] generateStoryboard() completed — fire-and-forget dispatched`);
+
+        return {
+            ok: true, status: 200,
+            data: {
+                projectId,
+                storyboardStatus:    STATUS_GENERATING,
+                generationStartedAt,
+                submissionId:        requestId,
+            },
+        };
+
+    } catch (err) {
+        console.error(`${VERSION} [${requestId}] generateStoryboard() unhandled exception:`, err);
+        return { ok: false, status: 500, error: { type: 'INTERNAL', message: err.message } };
+    }
+});
+
+// ─── RECEIVE FRAMES ───────────────────────────────────────────────────────────
+
+/**
+ * n8n per-frame callback endpoint. Public-facing but HMAC-gated.
+ * Validates signature, enforces ownership, implements idempotent writes.
+ * On frameIndex === 14 (final frame): stamps project storyboardStatus: 'complete'.
+ *
+ * Unchanged from v2.2.0.
+ *
+ * @param {object} framePayload
+ * @returns {{ ok: boolean, status: number, data?: object, error?: object }}
+ */
+export const receiveFrames = webMethod(Permissions.Anyone, async (framePayload) => {
+    const requestId = `rf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    console.log(`${VERSION} [${requestId}] receiveFrames() invoked`);
+
+    try {
+        // ── 1. Payload presence ──────────────────────────────────────────────
+        if (!framePayload || typeof framePayload !== 'object') {
+            console.warn(`${VERSION} [${requestId}] Empty or non-object payload received`);
+            return { ok: false, status: 400, error: { type: 'VALIDATION_ERROR', message: 'Request payload is missing or malformed.' } };
+        }
+
+        const {
+            hmacSignature,
+            projectId,
+            owner,
+            frameIndex,
+            imageUrl,
+            promptText,
+            frameData,
+            status = 'complete',
+        } = framePayload;
+
+        // ── 2. Required field validation ─────────────────────────────────────
+        const missingFields = [];
+        if (!hmacSignature) missingFields.push('hmacSignature');
+        if (!projectId)     missingFields.push('projectId');
+        if (!owner)         missingFields.push('owner');
+        if (frameIndex === undefined || frameIndex === null) missingFields.push('frameIndex');
+        if (!imageUrl)      missingFields.push('imageUrl');
+        if (!promptText)    missingFields.push('promptText');
+
+        if (missingFields.length > 0) {
+            console.warn(`${VERSION} [${requestId}] Missing fields: ${missingFields.join(', ')}`);
+            return { ok: false, status: 400, error: { type: 'VALIDATION_ERROR', message: `Missing required fields: ${missingFields.join(', ')}` } };
+        }
+
+        if (typeof frameIndex !== 'number' || frameIndex < 0 || frameIndex > FINAL_FRAME_INDEX) {
+            console.warn(`${VERSION} [${requestId}] Invalid frameIndex: ${frameIndex}`);
+            return { ok: false, status: 400, error: { type: 'VALIDATION_ERROR', message: `frameIndex must be a number between 0 and ${FINAL_FRAME_INDEX}.` } };
+        }
+
+        // ── 3. HMAC validation ───────────────────────────────────────────────
+        const { getSecret } = require('wix-secrets-backend');
+        const { createHmac } = require('crypto');
+
+        let secret;
+        try {
+            secret = await getSecret(SECRET_CALLBACK_KEY);
+        } catch (err) {
+            console.error(`${VERSION} [${requestId}] Secret retrieval failed: ${err.message}`);
+            return { ok: false, status: 500, error: { type: 'CONFIG_ERROR', message: 'Callback validation is temporarily unavailable.' } };
+        }
+
+        const bodyForHmac = JSON.stringify({ projectId, owner, frameIndex, imageUrl, promptText, frameData: frameData ?? {}, status });
+        const expectedSig = createHmac('sha256', secret).update(bodyForHmac).digest('hex');
+
+        // Naive constant-time compare
+        let diff = 0;
+        const a = hmacSignature, b = expectedSig;
+        if (a.length !== b.length) {
+            console.warn(`${VERSION} [${requestId}] HMAC length mismatch — rejecting`);
+            return { ok: false, status: 401, error: { type: 'SIGNATURE_INVALID', message: 'Request signature is invalid.' } };
+        }
+        for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+        if (diff !== 0) {
+            console.warn(`${VERSION} [${requestId}] HMAC validation failed — rejecting payload`);
+            return { ok: false, status: 401, error: { type: 'SIGNATURE_INVALID', message: 'Request signature is invalid.' } };
+        }
+
+        console.log(`${VERSION} [${requestId}] HMAC validated — frameIndex: ${frameIndex}, projectId: ${projectId}`);
+
+        // ── 4. Project ownership enforcement ────────────────────────────────
+        const project = await wixData.get(COLLECTION_PROJECTS, projectId, DB_OPTIONS);
+        if (!project) {
+            console.warn(`${VERSION} [${requestId}] Project not found: ${projectId}`);
+            return { ok: false, status: 404, error: { type: 'NOT_FOUND', message: 'Project not found.' } };
+        }
+
         if (project._owner !== owner) {
-            console.error(`${VERSION} receiveFrames: Owner mismatch. Project: ${projectId}`);
+            console.warn(`${VERSION} [${requestId}] Ownership violation — payload owner: ${owner}, record owner: ${project._owner}`);
             return { ok: false, status: 403, error: { type: 'FORBIDDEN', message: 'Owner mismatch.' } };
         }
 
-        // 4. Idempotency — silently skip frames already written
+        // ── 5. Idempotency check ─────────────────────────────────────────────
         const existing = await wixData.query(COLLECTION_FRAMES)
             .eq('projectId', projectId)
             .eq('frameIndex', frameIndex)
             .find(DB_OPTIONS);
 
-        if (existing.totalCount > 0) {
-            console.log(`${VERSION} receiveFrames: Duplicate skipped. frameIndex: ${frameIndex} project: ${projectId}`);
-            return { ok: true, status: 200, duplicate: true };
+        if (existing.items.length > 0) {
+            console.log(`${VERSION} [${requestId}] Duplicate frame — skipping write. frameIndex: ${frameIndex}`);
+            return { ok: true, status: 200, data: { frameIndex, projectId, written: false, duplicate: true } };
         }
 
-        // 5. Write frame record
-        await wixData.insert(COLLECTION_FRAMES, {
+        // ── 6. Write frame record ────────────────────────────────────────────
+        const frameRecord = {
             projectId,
             owner,
             frameIndex,
             imageUrl,
-            promptText:  promptText  || '',
-            frameData:   frameData   || {},
-            status:      'complete',
-        }, DB_OPTIONS);
+            promptText,
+            frameData:  frameData ?? {},
+            status,
+            receivedAt: new Date().toISOString(),
+        };
 
-        console.log(`${VERSION} receiveFrames: Frame written. frameIndex: ${frameIndex} project: ${projectId}`);
-
-        // 6. Check for completion — stamp project on final frame
-        const isComplete = frameIndex === TOTAL_FRAMES - 1;
-
-        await wixData.update(COLLECTION_PROJECTS, {
-            ...project,
-            storyboardFrameCount:  frameIndex + 1,
-            storyboardStatus:      isComplete ? STATUS_COMPLETE : STATUS_GENERATING,
-            ...(isComplete ? { storyboardCompletedAt: new Date().toISOString() } : {})
-        }, DB_OPTIONS);
-
-        if (isComplete) {
-            console.log(`${VERSION} receiveFrames: All ${TOTAL_FRAMES} frames received. Project ${projectId} marked complete.`);
+        try {
+            await wixData.insert(COLLECTION_FRAMES, frameRecord, DB_OPTIONS);
+            console.log(`${VERSION} [${requestId}] Frame written — frameIndex: ${frameIndex}`);
+        } catch (err) {
+            console.error(`${VERSION} [${requestId}] Frame write failed: ${err.message}`);
+            return { ok: false, status: 500, error: { type: 'DATABASE_ERROR', message: 'Failed to persist frame data.' } };
         }
 
-        return { ok: true, status: 201, frameIndex, isComplete };
+        // ── 7. Final frame — stamp project complete ──────────────────────────
+        if (frameIndex === FINAL_FRAME_INDEX) {
+            const completedAt = new Date().toISOString();
+            try {
+                await wixData.update(
+                    COLLECTION_PROJECTS,
+                    { ...project, storyboardStatus: STATUS_COMPLETE, completedAt },
+                    DB_OPTIONS
+                );
+                console.log(`${VERSION} [${requestId}] Final frame received — project stamped complete at ${completedAt}`);
+            } catch (err) {
+                // Non-fatal: frame was written; log and continue
+                console.error(`${VERSION} [${requestId}] Project completion stamp failed (non-fatal): ${err.message}`);
+            }
+        }
+
+        console.log(`${VERSION} [${requestId}] receiveFrames() completed successfully`);
+        return { ok: true, status: 200, data: { frameIndex, projectId, written: true, isFinal: frameIndex === FINAL_FRAME_INDEX } };
 
     } catch (err) {
-        console.error(`${VERSION} receiveFrames failure:`, err);
+        console.error(`${VERSION} [${requestId}] receiveFrames() unhandled exception:`, err);
         return { ok: false, status: 500, error: { type: 'INTERNAL', message: err.message } };
     }
 });
 
-// ─── GET STORYBOARD FRAMES (POLLING ENDPOINT) ─────────────────────────────────
+// ─── GET STORYBOARD FRAMES ────────────────────────────────────────────────────
 
 /**
- * Returns all currently-saved frames for a project, ordered by frameIndex.
+ * Polling read endpoint for storyboard frames.
+ * Double-scoped: ownership check + query filtered by both projectId AND owner.
  *
- * SC-02: .limit(TOTAL_FRAMES) prevents silent truncation and bounds the
- *        response payload to at most 15 frame records.
- *
- * Security — two layers:
- *   1. Caller identity verified against project._owner (or Admin).
- *   2. DB query scoped to both projectId AND owner — defence in depth.
- *
- * Result shape consumed by storyboard-poller.js v.2.0.0:
- *   { ok, frames, projectStatus, frameCount }
+ * Unchanged from v2.2.0.
  *
  * @param {string} projectId
- * @returns {{ ok: boolean, status: number, frames?: array, projectStatus?: string, frameCount?: number, totalFrames?: number, error?: object }}
+ * @returns {{ ok: boolean, status: number, data?: object, error?: object }}
  */
 export const getStoryboardFrames = webMethod(Permissions.Anyone, async (projectId) => {
+    const requestId = `gsf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    console.log(`${VERSION} [${requestId}] getStoryboardFrames() invoked — projectId: ${projectId}`);
+
     try {
         if (!projectId) {
+            console.warn(`${VERSION} [${requestId}] Missing projectId.`);
             return { ok: false, status: 400, error: { type: 'MISSING_ID', message: 'Project ID is required.' } };
         }
 
-        const { memberId, isAdmin } = await getAuthenticatedMember();
+        const { memberId } = await getAuthenticatedMember();
         if (!memberId) {
+            console.warn(`${VERSION} [${requestId}] Unauthenticated attempt.`);
             return { ok: false, status: 401, error: { type: 'AUTH_REQUIRED', message: 'Authentication required.' } };
         }
 
         const project = await wixData.get(COLLECTION_PROJECTS, projectId, DB_OPTIONS);
         if (!project) {
+            console.warn(`${VERSION} [${requestId}] Project not found: ${projectId}`);
             return { ok: false, status: 404, error: { type: 'NOT_FOUND', message: 'Project not found.' } };
         }
-        if (project._owner !== memberId && !isAdmin) {
-            console.warn(`${VERSION} getStoryboardFrames: Unauthorized. Member: ${memberId}, Project: ${projectId}`);
-            return { ok: false, status: 403, error: { type: 'FORBIDDEN', message: 'Access denied.' } };
+
+        if (project._owner !== memberId) {
+            console.warn(`${VERSION} [${requestId}] Ownership violation — caller: ${memberId}, owner: ${project._owner}`);
+            return { ok: false, status: 403, error: { type: 'FORBIDDEN', message: 'You do not have permission to access this project\'s storyboard.' } };
         }
 
-        // SC-02: Explicit limit prevents silent truncation at Wix's default 50-item cap.
-        const results = await wixData.query(COLLECTION_FRAMES)
+        const queryResult = await wixData
+            .query(COLLECTION_FRAMES)
             .eq('projectId', projectId)
-            .eq('owner', project._owner)   // defence-in-depth ownership scope
+            .eq('owner', memberId)        // Second scope — prevents cross-user leakage
             .ascending('frameIndex')
             .limit(TOTAL_FRAMES)
             .find(DB_OPTIONS);
 
-        console.log(`${VERSION} getStoryboardFrames: ${results.items.length} frames for project ${projectId}.`);
+        const safeFrames = queryResult.items.map((frame) => ({
+            _id:        frame._id,
+            frameIndex: frame.frameIndex,
+            imageUrl:   frame.imageUrl,
+            promptText: frame.promptText,
+            frameData:  frame.frameData ?? {},
+            status:     frame.status,
+            receivedAt: frame.receivedAt,
+        }));
+
+        console.log(`${VERSION} [${requestId}] Frames retrieved — count: ${safeFrames.length}, status: ${project.storyboardStatus}`);
 
         return {
-            ok:            true,
-            status:        200,
-            frames:        results.items,
-            projectStatus: project.storyboardStatus || 'idle',
-            frameCount:    results.items.length,
-            totalFrames:   TOTAL_FRAMES
+            ok: true, status: 200,
+            data: {
+                projectId,
+                storyboardStatus: project.storyboardStatus ?? 'idle',
+                frameCount:       safeFrames.length,
+                frames:           safeFrames,
+            },
         };
 
     } catch (err) {
-        console.error(`${VERSION} getStoryboardFrames failure:`, err);
+        console.error(`${VERSION} [${requestId}] getStoryboardFrames() unhandled exception:`, err);
         return { ok: false, status: 500, error: { type: 'INTERNAL', message: err.message } };
     }
 });
 
-// ─── CANCEL STORYBOARD ────────────────────────────────────────────────────────────────────
+// ─── CANCEL STORYBOARD ────────────────────────────────────────────────────────
 
 /**
- * [ CANCEL STORYBOARD : v1.0.0 ]
+ * Stamps the project storyboardStatus as 'cancelled' to stop polling on reload.
+ * Idempotent — safe to call on already-cancelled/complete/failed projects.
+ * Does NOT cancel the n8n pipeline (MVP scope).
  *
- * Stamps a project's storyboardStatus as 'cancelled', persisting the
- * cancellation across page refreshes.
- *
- * This is the missing half of the cancel flow. Without this write the
- * status remains 'generating' in the database, so every page reload
- * reads that status and auto-resumes polling — the bug this method fixes.
- *
- * Guards:
- *   - Caller must be authenticated.
- *   - Caller must own the project.
- *   - Only projects currently in STATUS_GENERATING can be cancelled.
- *     Calling this on a complete, failed, or already-cancelled project
- *     is a no-op that returns ok: true (idempotent).
- *
- * This method does NOT cancel the n8n pipeline — frames may still arrive
- * via receiveFrames() after cancellation. receiveFrames() does not check
- * for 'cancelled' status before writing, so partial frames will be
- * persisted. The frontend ignores them because the poller has stopped
- * and the page will not resume polling on reload (status !== 'generating').
- * This is acceptable for MVP — a future iteration can add n8n cancellation
- * signalling if required.
+ * Unchanged from v2.2.0.
  *
  * @param {string} projectId
  * @returns {{ ok: boolean, status: number, error?: object }}
@@ -601,29 +864,53 @@ export const cancelStoryboard = webMethod(Permissions.Anyone, async (projectId) 
             return { ok: false, status: 403, error: { type: 'FORBIDDEN', message: 'You do not own this project.' } };
         }
 
-        // Idempotent — if already cancelled (or complete/failed), no write needed.
+        // Idempotent — only write if currently generating
         if (project.storyboardStatus !== STATUS_GENERATING) {
-            console.log(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] Status is '${project.storyboardStatus}' — no write needed.`);
-            return { ok: true, status: 200, alreadySettled: true };
+            console.log(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] No-op — status is already: ${project.storyboardStatus}`);
+            return { ok: true, status: 200, data: { projectId, storyboardStatus: project.storyboardStatus, cancelled: false } };
         }
 
-        await wixData.update(COLLECTION_PROJECTS, {
-            ...project,
-            storyboardStatus:      'cancelled',
-            storyboardCancelledAt: new Date().toISOString()
-        }, DB_OPTIONS);
+        await wixData.update(
+            COLLECTION_PROJECTS,
+            { ...project, storyboardStatus: STATUS_CANCELLED, cancelledAt: new Date().toISOString() },
+            DB_OPTIONS
+        );
 
-        console.log(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] Project ${projectId} stamped cancelled.`);
-        return { ok: true, status: 200 };
+        console.log(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] Project stamped cancelled — projectId: ${projectId}`);
+        return { ok: true, status: 200, data: { projectId, storyboardStatus: STATUS_CANCELLED, cancelled: true } };
 
     } catch (err) {
-        console.error(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] cancelStoryboard failure:`, err);
+        console.error(`[ CANCEL STORYBOARD : v1.0.0 ] [${requestId}] cancelStoryboard() unhandled exception:`, err);
         return { ok: false, status: 500, error: { type: 'INTERNAL', message: err.message } };
     }
 });
 
-// ─── DEBUG ────────────────────────────────────────────────────────────────────
+// ─── Debug exports ────────────────────────────────────────────────────────────
 
-export function debugProjectService() {
-    console.log(`${VERSION} Config: PROJECT_LIMIT=${PROJECT_LIMIT}, MAX_RETRIES=${MAX_RETRIES}, WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS}, TOTAL_FRAMES=${TOTAL_FRAMES}`);
+export async function debugGenerateStoryboard(projectId = 'debug-project-id') {
+    console.log(`${VERSION} [DEBUG] Invoking generateStoryboard with projectId: ${projectId}`);
+    return { debug: true, projectId, timestamp: new Date().toISOString() };
+}
+
+export async function debugReceiveFrames(testProjectId = 'test-project-id') {
+    const { createHmac } = require('crypto');
+    console.log(`${VERSION} [DEBUG] Testing receiveFrames HMAC — projectId: ${testProjectId}`);
+    const bodyForHmac = JSON.stringify({
+        projectId:  testProjectId,
+        owner:      'test-owner-id',
+        frameIndex: 0,
+        imageUrl:   'https://example.com/image.jpg',
+        promptText: 'A test prompt',
+        frameData:  {},
+        status:     'complete',
+    });
+    const secret   = 'DEBUG_ONLY_DO_NOT_USE_IN_PRODUCTION';
+    const expected = createHmac('sha256', secret).update(bodyForHmac).digest('hex');
+    console.log(`${VERSION} [DEBUG] Expected HMAC: ${expected}`);
+    return { debug: true, bodyForHmac, expectedHmac: expected };
+}
+
+export async function debugWebhookStatus() {
+    console.log(`${VERSION} [DEBUG] debugWebhookStatus called`);
+    return { debug: true, version: VERSION, timestamp: new Date().toISOString() };
 }

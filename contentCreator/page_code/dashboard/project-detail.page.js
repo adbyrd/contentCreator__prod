@@ -3,43 +3,6 @@
  * Page: Project Detail (Dynamic)
  * Path: /page_code/dashboard/project-detail.page.js
  * Version: [ PROJECT DETAIL : v2.6.0 ]
- *
- * Changes (v2.5.0 → v2.6.0)
- * ─────────────────────────────────────────────────────────────────────────────
- * BUG FIX: Polling resumed after cancellation on page refresh.
- *
- * ROOT CAUSE:
- *   The v2.5.0 cancel flow stopped the frontend poller but never wrote
- *   anything to the database. storyboardStatus remained 'generating' in
- *   the projects collection. On the next page load $w.onReady read that
- *   status, saw 'generating', and correctly (per its own logic) resumed
- *   polling — because the system had no record that cancellation occurred.
- *
- * FIX — Two changes:
- *
- *   1. wireCancelButton() now calls cancelStoryboard() (new backend webMethod)
- *      BEFORE stopping the local poller. This stamps storyboardStatus as
- *      'cancelled' in the database. If the backend call fails the cancel
- *      is aborted — the user is shown an error and generation continues,
- *      keeping frontend and backend state in sync at all times.
- *
- *   2. The auto-resume guard in $w.onReady now explicitly checks for
- *      STATUS_GENERATING ('generating') only. The 'cancelled' status
- *      falls through without resuming the poller, so a refresh after
- *      cancellation correctly shows the idle Generate Storyboard state.
- *      (This was already the behaviour in v2.5.0 because the check was
- *      `=== 'generating'`, but it is now documented explicitly alongside
- *      the fix so the intent is clear.)
- *
- * New import
- * ─────────────────────────────────────────────────────────────────────────────
- *   cancelStoryboard from 'backend/services/project.web'
- *
- * New message constants
- * ─────────────────────────────────────────────────────────────────────────────
- *   MSG_CANCEL_FAILED — shown when the backend stamp fails; generation continues.
- *
- * All v2.5.0 behaviour is preserved unchanged.
  */
 
 import wixLocation  from 'wix-location';
