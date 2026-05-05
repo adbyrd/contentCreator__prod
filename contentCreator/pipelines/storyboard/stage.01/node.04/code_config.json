@@ -1,0 +1,20 @@
+[
+    {
+        "code": {
+            "name": "Prompt Gen — Start Log",
+            "parameters":{
+                "mode": "Run Once for All Items",
+                "language": "JavaScript",
+                "javascript": ""
+            },
+            "settings": {
+                "always_output_data": "FALSE",
+                "execute_once": "FALSE",
+                "retry_on_fail": "FALSE",
+                "on_error": "Stop Workflow",
+                "notes": "Logs PROMPT_GEN_START. Passes validated context to LLM node.",
+                "display_notes_in_flow": "TRUE"
+            }
+        }
+    }
+]

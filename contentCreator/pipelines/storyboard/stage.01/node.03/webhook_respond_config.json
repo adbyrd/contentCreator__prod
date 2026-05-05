@@ -1,0 +1,22 @@
+[
+    {
+        "webhook_respond": {
+            "name": "Respond 200 OK",
+            "parameters":{
+                "respond_with": "JSON",
+                "respond_body": "{\"ok\": \"true\"}",
+                "options": {
+                    "response_code": "200"
+                }
+            },
+            "settings": {
+                "always_output_data": "FALSE",
+                "execute_once": "FALSE",
+                "retry_on_fail": "FALSE",
+                "on_error": "Stop Workflow",
+                "notes": "Fire-and-forget: returns HTTP 200 to Wix immediately. Pipeline continues async.",
+                "display_notes_in_flow": "TRUE"
+            }
+        }
+    }
+]

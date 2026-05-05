@@ -25,7 +25,7 @@
                 "retry_on_fail": "FALSE",
                 "on_error": "Stop Workflow",
                 "notes": "Notes go here",
-                "display_notes_in_flow": "FALSE"
+                "display_notes_in_flow": "TRUE"
             }
         }
     }
