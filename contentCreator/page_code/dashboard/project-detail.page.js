@@ -1,20 +1,20 @@
 /**
- * [ FILE NAME : project-detail.page__v2.6.0 ]
+ * [ FILE NAME : project-detail.page__v2.6.1 ]
  * Page: Project Detail (Dynamic)
  * Path: /page_code/dashboard/project-detail.page.js
- * Version: [ PROJECT DETAIL : v2.6.0 ]
+ * Version: [ PROJECT DETAIL : v2.6.1 ]
  */
 
 import wixLocation  from 'wix-location';
 import wixWindow    from 'wix-window';
-import { verifyProjectAccess, cancelStoryboard } from 'backend/services/project.web';
-import { generateStoryboard }                    from 'backend/storyboard/generateStoryboard.web';
+import { verifyProjectAccess }                                        from 'backend/services/project.web';
+import { generateStoryboard, cancelStoryboard }                       from 'backend/storyboard/generateStoryboard.web';
 import { validateProjectForGeneration }                              from 'public/utils/validation';
 import { safeDisable, safeShow, safeHide, setButtonLoading }        from 'public/utils/ui';
 import { showToaster }                                              from 'public/utils/notification';
 import { startStoryboardPolling, stopStoryboardPolling }            from 'public/utils/storyboard-poller';
 
-const VERSION           = '[ PROJECT DETAIL : v2.6.0 ]';
+const VERSION           = '[ PROJECT DETAIL : v2.6.1 ]';
 const PATH_UNAUTHORIZED = '/cc';
 
 // ─── MESSAGES ─────────────────────────────────────────────────────────────────
