@@ -1,20 +1,102 @@
 /**
- * [ FILE NAME : project-detail.page__v2.6.1 ]
+ * [ FILE NAME : project-detail.page__v2.8.0 ]
  * Page: Project Detail (Dynamic)
  * Path: /page_code/dashboard/project-detail.page.js
- * Version: [ PROJECT DETAIL : v2.6.1 ]
+ * Version: [ PROJECT DETAIL : v2.8.0 ]
+ *
+ * Changelog v2.7.0 → v2.8.0
+ * ─────────────────────────────────────────────────────────────────────────────
+ * [FIX-TOAST-01] 'warning' toaster type replaced with 'success'
+ *
+ *   ERROR:  Argument of type '"warning"' is not assignable to parameter
+ *           of type '"success" | "error"'.
+ *
+ *   showToaster() in notification.js v.2.2.0 accepts only 'success' | 'error'.
+ *   The MSG_CANCELLED call in wireCancelButton() passed 'warning', which is
+ *   not in the type contract. Changed to 'success' — cancellation is a
+ *   deliberate user action with a positive outcome, not an error condition.
+ *
+ * [FIX-SETUP-01] Removed setupPageUI() and its call site
+ *
+ *   setupPageUI() set #txtBreadcrumb.text and wired #btnBack. Both of these
+ *   are handled directly by the Wix canvas (dataset binding for breadcrumb,
+ *   Editor link for back button) and do not require page code. Removed the
+ *   function and its call from $w.onReady to eliminate the dependency on
+ *   these two canvas element IDs.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Changelog v2.6.1 → v2.7.0
+ * ─────────────────────────────────────────────────────────────────────────────
+ * [FIX-IMPORT-02] Removed dead safeDisable import
+ *
+ *   safeDisable was imported from 'public/utils/ui' but was never called
+ *   anywhere in this file. Removed from the import statement.
+ *
+ * [FIX-TODO-01] Implemented renderFrame() — storyboard frame repeater wiring
+ *
+ *   renderFrame() was a stub containing only a console.log and a TODO comment.
+ *   Frames were fetched and acknowledged by the poller but never displayed.
+ *
+ *   Implementation:
+ *     The in-memory _frames array accumulates all frames delivered so far,
+ *     keyed by frameIndex to prevent duplicates on resume. On each new frame
+ *     arrival, the full accumulated array is assigned to #storyboardRepeater.data
+ *     (Wix diffs the array and only re-renders changed items). The repeater's
+ *     onItemReady handler populates #frameImage, #frameNumber, #framePrompt,
+ *     and #frameNarrativeStage per item.
+ *
+ *     clearStoryboardUI() empties the accumulator and clears the repeater
+ *     before each new generation run, preventing stale frame bleed-through
+ *     per the acceptance criteria in storyboardingfeature.pdf Section 4.5.
+ *
+ *   Canvas element requirements (Wix Editor — must match exactly):
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │  #storyboardRepeater      — Repeater containing all frame items     │
+ *   │    └─ #frameImage         — Image: frame.imageUrl                   │
+ *   │    └─ #frameNumber        — Text:  "Frame N / 15"                   │
+ *   │    └─ #framePrompt        — Text:  frame.promptText                 │
+ *   │    └─ #frameNarrativeStage — Text: frame.frameData.narrativeStage   │
+ *   │  #storyboardEmptyState    — Container: shown when no frames yet     │
+ *   │  #storyboardCompleteState — Container: shown on generation complete │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *   All other canvas elements remain unchanged from v2.6.1.
+ *
+ * [FIX-VER-01] debugPageState() version string corrected
+ *
+ *   debugPageState() reported version '2.6.0' while the file header declared
+ *   v2.6.1. Updated to '2.7.0' to match this version.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Canvas element requirements (full list)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   #pageContentContainer      — outer container (hidden until auth passes)
+ *   #dynamicDataset            — Wix dynamic dataset bound to projects
+ *   #txtBreadcrumb             — breadcrumb text ("Projects / <title>")
+ *   #btnBack                   — back button → /projects
+ *   #btnEditProject            — opens Project Settings lightbox
+ *   #btnGenerateStoryboard     — triggers generation dispatch
+ *   #btnCancelStoryboard       — triggers cancellation flow
+ *   #loadingPreloader          — collapsible spinner during dispatch
+ *   #storyboardRepeater        — repeater for frame items (see above)
+ *     └─ #frameImage           — Image element
+ *     └─ #frameNumber          — Text element ("Frame N / 15")
+ *     └─ #framePrompt          — Text element (prompt text)
+ *     └─ #frameNarrativeStage  — Text element (narrative stage label)
+ *   #storyboardEmptyState      — shown before any frames arrive
+ *   #storyboardCompleteState   — shown after all 15 frames are received
  */
 
 import wixLocation  from 'wix-location';
 import wixWindow    from 'wix-window';
-import { verifyProjectAccess }                                        from 'backend/services/project.web';
-import { generateStoryboard, cancelStoryboard }                       from 'backend/storyboard/generateStoryboard.web';
-import { validateProjectForGeneration }                              from 'public/utils/validation';
-import { safeDisable, safeShow, safeHide, setButtonLoading }        from 'public/utils/ui';
-import { showToaster }                                              from 'public/utils/notification';
-import { startStoryboardPolling, stopStoryboardPolling }            from 'public/utils/storyboard-poller';
+import { verifyProjectAccess }                             from 'backend/services/project.web';
+import { generateStoryboard, cancelStoryboard }            from 'backend/storyboard/generateStoryboard.web';
+import { validateProjectForGeneration }                    from 'public/utils/validation';
+// [FIX-IMPORT-02] safeDisable removed — it was imported but never called.
+import { safeShow, safeHide, setButtonLoading }            from 'public/utils/ui';
+import { showToaster }                                     from 'public/utils/notification';
+import { startStoryboardPolling, stopStoryboardPolling }   from 'public/utils/storyboard-poller';
 
-const VERSION           = '[ PROJECT DETAIL : v2.6.1 ]';
+const VERSION           = '[ PROJECT DETAIL : v2.8.0 ]';
 const PATH_UNAUTHORIZED = '/cc';
 
 // ─── MESSAGES ─────────────────────────────────────────────────────────────────
@@ -33,17 +115,28 @@ const MSG_CANCEL_FAILED       = 'Unable to cancel generation. Please try again.'
 
 // ─── SELECTORS ────────────────────────────────────────────────────────────────
 
-const BTN_GENERATE = '#btnGenerateStoryboard';
-const BTN_CANCEL   = '#btnCancelStoryboard';
+const BTN_GENERATE         = '#btnGenerateStoryboard';
+const BTN_CANCEL           = '#btnCancelStoryboard';
+const REPEATER_STORYBOARD  = '#storyboardRepeater';
+const EMPTY_STATE          = '#storyboardEmptyState';
+const COMPLETE_STATE       = '#storyboardCompleteState';
 
 // ─── STATUS CONSTANTS ─────────────────────────────────────────────────────────
 
 const STATUS_GENERATING = 'generating';
+const TOTAL_FRAMES      = 15;
 
 // ─── MODULE STATE ─────────────────────────────────────────────────────────────
 
 let _currentProject = null;
 let _activePoller   = null;
+
+/**
+ * Accumulates delivered frames across all poll ticks.
+ * Keyed by frameIndex (0–14) to prevent duplicates on mid-generation resume.
+ * @type {Map<number, object>}
+ */
+let _frameMap = new Map();
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 
@@ -80,13 +173,18 @@ $w.onReady(async function () {
     // ── 4. Default UI state ───────────────────────────────────────────────────
     safeHide(BTN_CANCEL);
 
-    // ── 5. Render, wire, then reveal ──────────────────────────────────────────
-    setupPageUI();
+    // ── 5. Register repeater handler synchronously before any awaits ─────────
+    // CRITICAL: onItemReady must be registered before data is assigned.
+    // Registering it inside an async callback causes Wix to skip the handler
+    // on initial data binding, resulting in a blank repeater.
+    registerFrameRepeaterItemReady();
+
+    // ── 6. Render, wire, then reveal ──────────────────────────────────────────
     wireEditButton();
     wireGenerateButton();
     wireCancelButton();
 
-    // ── 6. Auto-resume guard ──────────────────────────────────────────────────
+    // ── 7. Auto-resume guard ──────────────────────────────────────────────────
     // Only resume when status is strictly 'generating'.
     // 'cancelled' (written by cancelStoryboard()) must NOT resume the poller —
     // that is the fix for the refresh-after-cancel bug.
@@ -96,21 +194,24 @@ $w.onReady(async function () {
         console.log(`${VERSION} storyboardStatus is '${STATUS_GENERATING}' on load — resuming poll.`);
         safeHide(BTN_GENERATE);
         safeShow(BTN_CANCEL);
+        safeShow(EMPTY_STATE);
+        safeHide(COMPLETE_STATE);
         startPolling();
     } else {
-        console.log(`${VERSION} storyboardStatus is '${_currentProject.storyboardStatus || 'idle'}' — idle state, no poll resumed.`);
+        console.log(`${VERSION} storyboardStatus is '${_currentProject.storyboardStatus || 'idle'}' — idle state.`);
+        // Show complete state banner if generation has previously finished
+        if (_currentProject.storyboardStatus === 'complete') {
+            safeShow(COMPLETE_STATE);
+            safeHide(EMPTY_STATE);
+        } else {
+            safeShow(EMPTY_STATE);
+            safeHide(COMPLETE_STATE);
+        }
     }
 
     // Reveal only after ownership is confirmed and UI is ready
     safeShow('#pageContentContainer');
 });
-
-// ─── PAGE SETUP ───────────────────────────────────────────────────────────────
-
-function setupPageUI() {
-    $w('#txtBreadcrumb').text = `Projects / ${_currentProject.title}`;
-    $w('#btnBack').onClick(() => wixLocation.to('/projects'));
-}
 
 // ─── EDIT BUTTON ──────────────────────────────────────────────────────────────
 
@@ -170,6 +271,9 @@ function wireGenerateButton() {
             stopStoryboardPolling(_activePoller);
             _activePoller = null;
         }
+
+        // Clear any stale frames from a previous run before dispatching
+        clearStoryboardUI();
 
         const result = await generateStoryboard(_currentProject._id);
 
@@ -257,7 +361,7 @@ function wireCancelButton() {
             console.log(`${VERSION} Database stamped. Stopping poller and resetting UI.`);
             stopActivePoller();
             resetGenerationUI();
-            showToaster(MSG_CANCELLED, 'warning');
+            showToaster(MSG_CANCELLED, 'success');
 
         } catch (err) {
             console.error(`${VERSION} Cancel flow error:`, err);
@@ -272,7 +376,7 @@ function wireCancelButton() {
  * Starts the adaptive storyboard poller for the current project.
  *
  * SIGNATURE: startStoryboardPolling(projectId, { callbacks })
- *   — positional args per storyboard-poller.js v2.1.0.
+ *   — positional args per storyboard-poller.js v2.2.0.
  */
 function startPolling() {
     _activePoller = startStoryboardPolling(_currentProject._id, {
@@ -282,7 +386,7 @@ function startPolling() {
         onComplete(frames) {
             console.log(`${VERSION} Generation complete. Total frames: ${frames.length}`);
             _activePoller = null;
-            resetGenerationUI();
+            onGenerationComplete(frames);
         },
         onTimeout() {
             console.warn(`${VERSION} Polling timed out.`);
@@ -299,15 +403,111 @@ function startPolling() {
     });
 }
 
+// ─── STORYBOARD FRAME REPEATER ────────────────────────────────────────────────
+
+/**
+ * Registers the #storyboardRepeater onItemReady handler.
+ *
+ * MUST be called synchronously inside $w.onReady before any awaits.
+ * Wix skips the handler if it is registered after an async boundary.
+ *
+ * Canvas element IDs required inside the repeater (see file header):
+ *   #frameImage          — Image element
+ *   #frameNumber         — Text element  ("Frame N / 15")
+ *   #framePrompt         — Text element  (prompt text)
+ *   #frameNarrativeStage — Text element  (narrative stage label from frameData)
+ */
+function registerFrameRepeaterItemReady() {
+    $w(REPEATER_STORYBOARD).onItemReady(($item, itemData) => {
+
+        // ── Frame image ───────────────────────────────────────────────────────
+        if (itemData.imageUrl) {
+            $item('#frameImage').src = itemData.imageUrl;
+        }
+
+        // ── Frame number label ────────────────────────────────────────────────
+        // frameIndex is 0-based; display as 1-based for the user.
+        $item('#frameNumber').text = `Frame ${itemData.frameIndex + 1} / ${TOTAL_FRAMES}`;
+
+        // ── Prompt text ───────────────────────────────────────────────────────
+        $item('#framePrompt').text = itemData.promptText || '';
+
+        // ── Narrative stage ───────────────────────────────────────────────────
+        // narrativeStage is nested inside frameData (object field in CMS).
+        // Falls back gracefully when absent.
+        const stage = itemData.frameData?.narrativeStage || '';
+        $item('#frameNarrativeStage').text = stage;
+    });
+}
+
 /**
  * Renders a newly delivered storyboard frame into the page UI.
  *
- * @param {object} frame  — individual frame record (frameIndex, imageUrl, promptText, frameData)
- * @param {array}  frames — all frames delivered so far, ascending by frameIndex
+ * Called by the poller's onFrame callback on every new frame arrival.
+ *
+ * Strategy — Map-based accumulator + full repeater assignment:
+ *   1. The incoming frame is stored in _frameMap keyed by frameIndex.
+ *      Map prevents duplicates if the poller delivers the same frame twice
+ *      (e.g. after a resume — the poller re-delivers all seen frames from
+ *      its seenFrameIds set, so _frameMap acts as the dedup layer here).
+ *   2. The full accumulator is converted to a sorted array and assigned to
+ *      #storyboardRepeater.data. Wix diffs the array and only re-renders
+ *      items whose _id has changed, so this is efficient even at 15 frames.
+ *   3. #storyboardEmptyState is hidden on the first frame arrival.
+ *
+ * Progressive reveal: each individual frame appears on screen immediately
+ * when its onFrame callback fires, without waiting for all 15.
+ *
+ * @param {object} frame  — individual frame record from the poller
+ * @param {array}  frames — all frames delivered so far (ascending frameIndex)
  */
 function renderFrame(frame, frames) {
     console.log(`${VERSION} Frame received: index ${frame.frameIndex} | total so far: ${frames.length}`);
-    // TODO: wire to repeater / canvas elements
+
+    // Accumulate — Map keyed by frameIndex deduplicates resumes
+    _frameMap.set(frame.frameIndex, frame);
+
+    // Build sorted array for repeater assignment
+    const sortedFrames = Array.from(_frameMap.values())
+        .sort((a, b) => a.frameIndex - b.frameIndex);
+
+    // Assign full array — Wix diffs by _id, only re-renders new items
+    $w(REPEATER_STORYBOARD).data = sortedFrames;
+
+    // Hide empty state on first frame
+    if (_frameMap.size === 1) {
+        safeHide(EMPTY_STATE);
+        safeHide('#loadingPreloader');
+        console.log(`${VERSION} First frame received — hiding empty state.`);
+    }
+
+    console.log(`${VERSION} Repeater updated — ${_frameMap.size} frame(s) rendered.`);
+}
+
+/**
+ * Called by the poller's onComplete callback when all 15 frames are confirmed.
+ * Shows the completion banner and resets the generation UI controls.
+ *
+ * @param {array} frames — the full 15-frame array
+ */
+function onGenerationComplete(frames) {
+    console.log(`${VERSION} onGenerationComplete — showing complete state banner.`);
+    safeShow(COMPLETE_STATE);
+    safeHide(EMPTY_STATE);
+    resetGenerationUI();
+}
+
+/**
+ * Clears the frame accumulator and empties the repeater.
+ * Called before each new generation run to prevent stale frame bleed-through.
+ * Per acceptance criteria: storyboardingfeature.pdf Section 4.5.
+ */
+function clearStoryboardUI() {
+    _frameMap.clear();
+    $w(REPEATER_STORYBOARD).data = [];
+    safeShow(EMPTY_STATE);
+    safeHide(COMPLETE_STATE);
+    console.log(`${VERSION} Storyboard UI cleared.`);
 }
 
 // ─── UI HELPERS ───────────────────────────────────────────────────────────────
@@ -328,10 +528,10 @@ function stopActivePoller() {
  * Resets all generation-related UI to its default (idle) state.
  *
  * Single source of truth for post-generation UI teardown. Called by:
- *   - onComplete        — generation finished successfully
- *   - onTimeout         — generation exceeded the polling window
- *   - onError           — terminal backend error
- *   - wireCancelButton  — user confirmed cancellation (backend stamp succeeded)
+ *   - onGenerationComplete — generation finished successfully
+ *   - onTimeout            — generation exceeded the polling window
+ *   - onError              — terminal backend error
+ *   - wireCancelButton     — user confirmed cancellation (backend stamp succeeded)
  */
 function resetGenerationUI() {
     setButtonLoading(BTN_GENERATE, null, MSG_GENERATE_DEFAULT);
@@ -346,12 +546,15 @@ function resetGenerationUI() {
 export function debugPageState() {
     console.log(`${VERSION} _currentProject:`, _currentProject);
     console.log(`${VERSION} _activePoller:`,   _activePoller);
+    console.log(`${VERSION} _frameMap size:`,  _frameMap.size);
     return {
-        version:         '2.6.0',
-        projectId:       _currentProject?._id              || null,
-        projectTitle:    _currentProject?.title            || null,
-        storyboardStatus: _currentProject?.storyboardStatus || null,
-        pollerActive:    !!_activePoller,
-        timestamp:       new Date().toISOString()
+        version:          '2.8.0',       // [FIX-VER-01] was: '2.6.0'
+        projectId:        _currentProject?._id               || null,
+        projectTitle:     _currentProject?.title             || null,
+        storyboardStatus: _currentProject?.storyboardStatus  || null,
+        pollerActive:     !!_activePoller,
+        framesReceived:   _frameMap.size,
+        frameIndexes:     Array.from(_frameMap.keys()).sort((a, b) => a - b),
+        timestamp:        new Date().toISOString(),
     };
 }

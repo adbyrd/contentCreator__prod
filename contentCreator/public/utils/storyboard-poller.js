@@ -1,10 +1,37 @@
 /**
- * [ FILE NAME : storyboard-poller__v2.1.0 ]
+ * [ FILE NAME : storyboard-poller__v2.2.0 ]
  * Utility: Storyboard Poller
  * Path: /public/utils/storyboard-poller.js
- * Version: [ STORYBOARD POLLER : v2.1.0 ]
+ * Version: [ STORYBOARD POLLER : v2.2.0 ]
  *
- * BUG FIX (v2.0.0 → v2.1.0)
+ * Changelog v2.1.0 → v2.2.0
+ * ─────────────────────────────────────────────────────────────────────────────
+ * [FIX-IMPORT-01] getStoryboardFrames import path corrected
+ *
+ *   ERROR (runtime): Module not found — getStoryboardFrames does not exist
+ *   as an export of backend/services/project.web.
+ *
+ *   ROOT CAUSE:
+ *     getStoryboardFrames was designed in storyboardingfeature.pdf (Section
+ *     4.3) as an addition to project.web.js, but was correctly implemented
+ *     as its own standalone file at:
+ *
+ *       /backend/storyboard/getStoryboardFrames.web.js
+ *
+ *     This follows the micro-module DDD architecture defined in the project
+ *     structure standards, where each storyboard operation (generate,
+ *     receive, query) lives in its own .web.js file under /backend/storyboard/.
+ *     The poller's import was never updated to reflect this.
+ *
+ *   FIX:
+ *     Changed import source from 'backend/services/project.web' to
+ *     'backend/storyboard/getStoryboardFrames.web' — the actual registered
+ *     path of the getStoryboardFrames webMethod (v1.1.0+).
+ *
+ * All other behaviour is identical to v2.1.0.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * BUG FIX (v2.0.0 → v2.1.0) — preserved for history
  * ─────────────────────────────────────────────────────────────────────────────
  * ISSUE: Poller continued firing after stopStoryboardPolling() was called
  *        via the Cancel Storyboard confirmation flow.
@@ -52,9 +79,12 @@
  *   - Contract: startStoryboardPolling(projectId, { callbacks }) → { stop }
  */
 
-import { getStoryboardFrames } from 'backend/services/project.web';
+// [FIX-IMPORT-01] was: 'backend/services/project.web' — getStoryboardFrames
+// is not exported from project.web.js. It lives in its own module at:
+// /backend/storyboard/getStoryboardFrames.web.js
+import { getStoryboardFrames } from 'backend/storyboard/getStoryboardFrames.web';
 
-const VERSION = '[ STORYBOARD POLLER : v2.1.0 ]';
+const VERSION = '[ STORYBOARD POLLER : v2.2.0 ]';
 
 // ─── ADAPTIVE INTERVAL CONFIGURATION ─────────────────────────────────────────
 
@@ -188,24 +218,24 @@ export function startStoryboardPolling(projectId, {
                 return;
             }
 
-            const { frames = [], projectStatus, frameCount } = result;
+            const { frames = [], storyboardStatus, frameCount } = result.data;
 
             // Fire onFrame for each frame not yet seen, in ascending order
             for (const frame of frames) {
                 if (!seenFrameIds.has(frame._id)) {
                     seenFrameIds.add(frame._id);
                     console.log(`${VERSION} New frame: index ${frame.frameIndex} | project: ${projectId}`);
-                    if (typeof onFrame === 'function') onFrame(frame, frames);
+                    if (typeof onFrame === 'function') onFrame(frame, [...frames]);
                 }
             }
 
             // Check for completion
-            const isDone = projectStatus === 'complete' || frameCount >= TOTAL_FRAMES;
+            const isDone = storyboardStatus === 'complete' || frameCount >= TOTAL_FRAMES;
 
             if (isDone) {
                 console.log(`${VERSION} All frames received for project: ${projectId}. Stopping poll.`);
                 cleanup();
-                if (typeof onComplete === 'function') onComplete(frames);
+                if (typeof onComplete === 'function') onComplete([...frames]);
                 return;
             }
 

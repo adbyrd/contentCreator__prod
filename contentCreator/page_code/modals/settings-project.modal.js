@@ -1,40 +1,76 @@
 /**
- * [ FILE NAME : settings-project.modal__v.1.5.0 ]
+ * [ FILE NAME : settings-project.modal__v.1.6.0 ]
  * Modal: Project Settings
  * Path: /page_code/modals/settings-project.modal.js
- * Version: [ PROJECT SETTINGS : v.1.5.0 ]
+ * Version: [ PROJECT SETTINGS : v.1.6.0 ]
  *
- * Refactor notes (v.1.4.0 → v.1.5.0)
+ * Changelog v.1.5.0 → v.1.6.0
  * ─────────────────────────────────────────────────────────────────────────────
- * CR-01 FIX — Import alignment
- *   REMOVED: import of showInlineError / clearInlineError from notification.js
- *            → notification.js does not export these functions (only showToaster,
- *              showError, debugNotifications). Reverted to local helpers.
- *   REMOVED: import of setButtonLoading from ui.js
- *            → ui.js only exports showModalError. setButtonLoading does not exist
- *              in the repo. Reverted to local updateLoadingState().
+ * [CR-01 / UTIL-01] Removed local updateLoadingState() — replaced with
+ * setButtonLoading() + safeDisable() / safeEnable() from public/utils/ui.
  *
+ *   The local updateLoadingState(isLoading) helper managed two buttons
+ *   (#btnSave and #btnCancel) and also reset the _isSaving flag on exit.
+ *   Replaced with:
+ *     - setButtonLoading(selector, loadingLabel, defaultLabel) — handles
+ *       label + disable/enable for #btnSave in one call.
+ *     - safeDisable(selector) / safeEnable(selector) — explicit calls for
+ *       #btnCancel alongside the save button.
+ *   The _isSaving = false side-effect is now set explicitly in handleSave()
+ *   immediately before the two exit-state calls, preserving the original
+ *   ordering guarantee.
+ *
+ * [CR-01 / UTIL-02] Removed local showInlineError() / clearInlineError() —
+ * replaced with showModalError() / safeHide() from public/utils/ui.
+ *
+ *   The local showInlineError(message) and clearInlineError() helpers used a
+ *   hardcoded SEL_INLINE_ERROR constant internally. ui.js exports:
+ *     - showModalError(selector, message) — expand + set text, no auto-dismiss
+ *       (correct for field-level validation errors that persist until corrected)
+ *     - safeHide(selector) — collapse the error element
+ *   All internal call sites updated to pass SEL_INLINE_ERROR as the first
+ *   argument. The external API of the module is unchanged.
+ *
+ * All other behaviour is identical to v.1.5.0.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Refactor notes (v.1.4.0 → v.1.5.0) — preserved for history
+ * ─────────────────────────────────────────────────────────────────────────────
  * ISSUE#4 FIX — Cancel button element name
  *   Corrected element selector from #btnClose → #btnCancel per the Issue#4
  *   ticket spec and canvas element naming convention.
- *   #btnCancel is also disabled during save and re-enabled on completion or
- *   failure, preventing a close race during async operations.
  *
  * CATCH BLOCK FIX
  *   v.1.4.0 was calling wixWindow.lightbox.close({ updated: false }) inside the
- *   catch block. This incorrectly dismissed the modal on error, preventing the
- *   user from seeing the inline error message or retrying. Removed. The modal
- *   now stays open on failure; only inline error + loading state reset occur.
+ *   catch block. This incorrectly dismissed the modal on error. Removed. The
+ *   modal now stays open on failure; only inline error + loading state reset occur.
  *
- * Behaviour otherwise identical to v.1.3.1:
+ * Behaviour:
  *   CREATE mode — two-step wizard (Details → Next → Scope → Save)
  *   EDIT mode   — opens at step 1 with all fields pre-filled; user advances normally
+ *
+ * Canvas element requirements
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   #projectHeading       — Text: modal title ("New Project" / "Update Project")
+ *   #setUpNewProject      — Multi-state box with states: projectDetails, projectScope
+ *   #btnNext              — Step 1 → Step 2 navigation button
+ *   #btnSave              — Save / Save Changes button
+ *   #btnCancel            — Dismiss without saving
+ *   #newProjectError      — Collapsible inline error container (Step 1)
+ *   #projectName          — Text input: project title
+ *   #projectDescription   — Text input: project description
+ *   #projectGoal          — Text input: project goal
+ *   #projectOffer         — Text input: offer
+ *   #projectAudience      — Text input: target audience
+ *   #projectMisconception — Text input: misconception
  */
 
-import wixWindow             from 'wix-window';
+import wixWindow                        from 'wix-window';
 import { createProject, updateProject } from 'backend/services/project.web';
+// [CR-01 / UTIL-01,02] Canonical UI primitives — replaces all local helpers
+import { setButtonLoading, safeDisable, safeEnable, showModalError, safeHide } from 'public/utils/ui';
 
-const VERSION = '[ PROJECT SETTINGS : v.1.5.0 ]';
+const VERSION = '[ PROJECT SETTINGS : v.1.6.0 ]';
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
@@ -56,7 +92,7 @@ const MSG_SAVE_EDIT           = 'Save Changes';
 // Canvas element selectors — defined as constants so a rename only touches one place
 const SEL_INLINE_ERROR = '#newProjectError';
 const SEL_BTN_SAVE     = '#btnSave';
-const SEL_BTN_CANCEL   = '#btnCancel';   // Issue#4: correct element name per canvas spec
+const SEL_BTN_CANCEL   = '#btnCancel';
 
 // ─── MODULE STATE ─────────────────────────────────────────────────────────────
 
@@ -92,7 +128,8 @@ function initModal(project = null) {
     $w('#projectName').maxLength        = MAX_TITLE_LENGTH;
     $w('#projectDescription').maxLength = MAX_DESC_LENGTH;
 
-    clearInlineError();
+    // [CR-01 / UTIL-02] was: clearInlineError()
+    safeHide(SEL_INLINE_ERROR);
 
     if (_isEditMode && project) {
         $w('#projectHeading').text = 'Update Project';
@@ -134,7 +171,7 @@ function hydrateForm(project) {
 /**
  * Registers all interactive element handlers.
  *
- * Issue#4 — Cancel: wixWindow.lightbox.close() is called with no payload,
+ * Cancel: wixWindow.lightbox.close() is called with no payload,
  * signalling to the caller that the user dismissed without saving.
  */
 function wireEventHandlers() {
@@ -150,7 +187,7 @@ function wireEventHandlers() {
     // Save / submit
     $w(SEL_BTN_SAVE).onClick(() => handleSave());
 
-    // Issue#4 — Cancel button: close the lightbox without saving
+    // Cancel button: close the lightbox without saving
     $w(SEL_BTN_CANCEL).onClick(() => {
         console.log(`${VERSION} User cancelled. Closing modal without saving.`);
         wixWindow.lightbox.close();
@@ -168,42 +205,18 @@ function validateFieldsInline() {
     const title = $w('#projectName').value;
     const desc  = $w('#projectDescription').value;
 
-    if (title.length > MAX_TITLE_LENGTH) { showInlineError(MSG_TITLE_TOO_LONG); return; }
-    if (desc.length  > MAX_DESC_LENGTH)  { showInlineError(MSG_DESC_TOO_LONG);  return; }
+    // [CR-01 / UTIL-02] showInlineError(msg) → showModalError(SEL_INLINE_ERROR, msg)
+    //                   clearInlineError()   → safeHide(SEL_INLINE_ERROR)
+    if (title.length > MAX_TITLE_LENGTH) { showModalError(SEL_INLINE_ERROR, MSG_TITLE_TOO_LONG); return; }
+    if (desc.length  > MAX_DESC_LENGTH)  { showModalError(SEL_INLINE_ERROR, MSG_DESC_TOO_LONG);  return; }
 
     const titleInvalid = title.length > 0 && !ALPHANUMERIC_REGEX.test(title);
     const descInvalid  = desc.length  > 0 && !ALPHANUMERIC_REGEX.test(desc);
 
-    if      (titleInvalid && descInvalid) showInlineError(MSG_INVALID_BOTH);
-    else if (titleInvalid)                showInlineError(MSG_INVALID_TITLE);
-    else if (descInvalid)                 showInlineError(MSG_INVALID_DESCRIPTION);
-    else                                  clearInlineError();
-}
-
-// ─── INLINE ERROR HELPERS ─────────────────────────────────────────────────────
-
-/**
- * Surfaces a validation message in the Step 1 inline error element.
- * Local implementation — notification.js does not export this function.
- *
- * @param {string} message
- */
-function showInlineError(message) {
-    const $error = $w(SEL_INLINE_ERROR);
-    if (!$error) return;
-    $error.text = message;
-    if (typeof $error.expand === 'function') $error.expand();
-    console.warn(`${VERSION} Validation error: ${message}`);
-}
-
-/**
- * Hides the Step 1 inline error element.
- * Local implementation — notification.js does not export this function.
- */
-function clearInlineError() {
-    const $error = $w(SEL_INLINE_ERROR);
-    if (!$error) return;
-    if (typeof $error.collapse === 'function') $error.collapse();
+    if      (titleInvalid && descInvalid) showModalError(SEL_INLINE_ERROR, MSG_INVALID_BOTH);
+    else if (titleInvalid)                showModalError(SEL_INLINE_ERROR, MSG_INVALID_TITLE);
+    else if (descInvalid)                 showModalError(SEL_INLINE_ERROR, MSG_INVALID_DESCRIPTION);
+    else                                  safeHide(SEL_INLINE_ERROR);
 }
 
 // ─── STATE TRANSITION ─────────────────────────────────────────────────────────
@@ -225,13 +238,13 @@ function validateSummaryState() {
     const title = $w('#projectName').value;
     const desc  = $w('#projectDescription').value;
 
-    if (!title || !desc)                  { showInlineError('Project name and description are required.'); return false; }
-    if (title.length > MAX_TITLE_LENGTH)  { showInlineError(MSG_TITLE_TOO_LONG); return false; }
-    if (desc.length  > MAX_DESC_LENGTH)   { showInlineError(MSG_DESC_TOO_LONG);  return false; }
-    if (!ALPHANUMERIC_REGEX.test(title))  { showInlineError(MSG_INVALID_TITLE);  return false; }
-    if (!ALPHANUMERIC_REGEX.test(desc))   { showInlineError(MSG_INVALID_DESCRIPTION); return false; }
+    if (!title || !desc)                  { showModalError(SEL_INLINE_ERROR, 'Project name and description are required.'); return false; }
+    if (title.length > MAX_TITLE_LENGTH)  { showModalError(SEL_INLINE_ERROR, MSG_TITLE_TOO_LONG); return false; }
+    if (desc.length  > MAX_DESC_LENGTH)   { showModalError(SEL_INLINE_ERROR, MSG_DESC_TOO_LONG);  return false; }
+    if (!ALPHANUMERIC_REGEX.test(title))  { showModalError(SEL_INLINE_ERROR, MSG_INVALID_TITLE);  return false; }
+    if (!ALPHANUMERIC_REGEX.test(desc))   { showModalError(SEL_INLINE_ERROR, MSG_INVALID_DESCRIPTION); return false; }
 
-    clearInlineError();
+    safeHide(SEL_INLINE_ERROR);
     return true;
 }
 
@@ -267,7 +280,7 @@ async function handleSave() {
     if (!validateScopeState()) return;
 
     _isSaving = true;
-    updateLoadingState(true);
+    _enterLoadingState();
 
     const projectData = {
         title:           $w('#projectName').value,
@@ -301,39 +314,48 @@ async function handleSave() {
         console.error(`${VERSION} Save failed:`, err);
         // Keep the modal open so the user can see the error and retry.
         // Do NOT call wixWindow.lightbox.close() here.
-        showInlineError(err.message || MSG_SAVE_FAILED);
-        updateLoadingState(false);
+        showModalError(SEL_INLINE_ERROR, err.message || MSG_SAVE_FAILED);
+        _isSaving = false;
+        _exitLoadingState();
     }
 }
 
 // ─── LOADING STATE ────────────────────────────────────────────────────────────
 
 /**
- * Manages the save button and cancel button enabled/disabled states during
- * async operations.
+ * Enters the saving state: disables both action buttons and updates the
+ * save button label.
  *
- * Local implementation — ui.js does not export setButtonLoading.
- *
- * @param {boolean} isLoading
+ * [CR-01 / UTIL-01] Replaces updateLoadingState(true).
+ * Uses setButtonLoading() for #btnSave and safeDisable() for #btnCancel.
  */
-function updateLoadingState(isLoading) {
-    if (isLoading) {
-        $w(SEL_BTN_SAVE).label = MSG_SAVING;
-        $w(SEL_BTN_SAVE).disable();
-        $w(SEL_BTN_CANCEL).disable();
-    } else {
-        $w(SEL_BTN_SAVE).label = _isEditMode ? MSG_SAVE_EDIT : MSG_SAVE_CREATE;
-        $w(SEL_BTN_SAVE).enable();
-        $w(SEL_BTN_CANCEL).enable();
-        _isSaving = false;
-    }
+function _enterLoadingState() {
+    setButtonLoading(SEL_BTN_SAVE, MSG_SAVING, _isEditMode ? MSG_SAVE_EDIT : MSG_SAVE_CREATE);
+    safeDisable(SEL_BTN_CANCEL);
+}
+
+/**
+ * Exits the saving state: re-enables both action buttons and restores the
+ * save button label.
+ *
+ * [CR-01 / UTIL-01] Replaces updateLoadingState(false).
+ * Uses setButtonLoading() for #btnSave and safeEnable() for #btnCancel.
+ *
+ * NOTE: _isSaving must be set to false by the caller before invoking this
+ * function, since setButtonLoading re-enables the button immediately and a
+ * subsequent click could otherwise re-enter handleSave() before _isSaving
+ * is cleared.
+ */
+function _exitLoadingState() {
+    setButtonLoading(SEL_BTN_SAVE, null, _isEditMode ? MSG_SAVE_EDIT : MSG_SAVE_CREATE);
+    safeEnable(SEL_BTN_CANCEL);
 }
 
 // ─── DEBUG EXPORT ─────────────────────────────────────────────────────────────
 
 export function debugModalState() {
     return {
-        version:    '1.5.0',
+        version:    '1.6.0',
         isEditMode: _isEditMode,
         projectId:  _projectId,
         isSaving:   _isSaving,

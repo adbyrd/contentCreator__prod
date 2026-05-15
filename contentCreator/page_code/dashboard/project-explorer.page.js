@@ -1,16 +1,33 @@
 /**
- * [ FILE NAME : project-explorer.page__v.2.1.0 ]
+ * [ FILE NAME : project-explorer.page__v.2.2.0 ]
  * Page: Project Explorer
  * Path: /page_code/dashboard/project-explorer.page.js
- * Version: [ PROJECT EXPLORER : v.2.1.0 ]
+ * Version: [ PROJECT EXPLORER : v.2.2.0 ]
  *
- * Refactor notes (v.2.0.0 → v.2.1.0)
+ * Refactor notes (v.2.1.0 → v.2.2.0)
  * ─────────────────────────────────────────────────────────────────────────────
- * IMPORT FIX — safeShow / safeHide
- *   v.2.0.0 imported safeShow / safeHide from 'public/utils/ui'. ui.js only
- *   exports showModalError. safeShow / safeHide are exported by
- *   public/utils/validation. Corrected import path.
+ * [FIX-IMPORT-03] safeShow / safeHide import path corrected
  *
+ *   ERROR (runtime):  ReferenceError on every page load — safeShow and
+ *   safeHide do not exist in the module resolved from 'public/utils/validation'.
+ *
+ *   ROOT CAUSE:
+ *     validation.js was refactored in v.2.0.0 (CR-01 / SF-04) to remove all
+ *     UI helpers. safeShow and safeHide were moved to public/utils/ui.js,
+ *     which is the sole authoritative source for UI primitives per CR-01.
+ *     The v.2.1.0 file header acknowledged the v.2.0.0 import fix but
+ *     incorrectly re-pointed the import back to validation.js, recreating
+ *     the exact bug it claimed to fix.
+ *
+ *   FIX:
+ *     Import safeShow and safeHide from 'public/utils/ui' — the correct
+ *     location per CR-01 and the ui.js v.2.0.0 module contract.
+ *
+ * All other behaviour is identical to v.2.1.0.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Refactor notes (v.2.0.0 → v.2.1.0) — preserved for history
+ * ─────────────────────────────────────────────────────────────────────────────
  * ISSUE#1 — Default Image
  *   onItemReady now reads itemData.firstFrameImage and assigns it to
  *   #projectPreviewImage. Falls back to DEFAULT_PROJECT_IMAGE if the field
@@ -34,10 +51,9 @@
  *
  * PAGINATION — preserved from v.2.0.0 (SC-02 / SC-07)
  *   Load More pattern with _nextCursor accumulation is retained.
- *   NOTE: The current backend (project.web__v.1.7.0) does not yet accept a
- *   cursor argument — getMyProjects() accepts no parameters. The cursor is
- *   stored and passed for forward-compatibility but the backend ignores it
- *   until the service is upgraded. The UI behaves correctly regardless.
+ *   The cursor value is an opaque string passed back to getMyProjects()
+ *   unchanged; the backend (project.web.js v2.8.0+) uses it as a skip
+ *   offset for page-based pagination.
  *
  * Canvas element requirements
  * ─────────────────────────────────────────────────────────────────────────────
@@ -57,10 +73,11 @@ import wixLocation from 'wix-location';
 import wixWindow   from 'wix-window';
 import { getMyProjects, getUserProjectCount } from 'backend/services/project.web';
 import { showToaster }                        from 'public/utils/notification';
-// safeShow / safeHide live in validation.js — ui.js does not export them
-import { safeShow, safeHide }                 from 'public/utils/validation';
+// [FIX-IMPORT-03] safeShow / safeHide belong in ui.js (CR-01 / SF-04).
+// validation.js v.2.0.0 removed these exports. Importing from the correct source.
+import { safeShow, safeHide }                 from 'public/utils/ui';
 
-const VERSION = '[ PROJECT EXPLORER : v.2.1.0 ]';
+const VERSION = '[ PROJECT EXPLORER : v.2.2.0 ]';
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
@@ -75,10 +92,6 @@ const DEFAULT_PROJECT_IMAGE = 'https://static.wixstatic.com/media/155164_a0720eb
  * Cursor returned by the last getMyProjects() call.
  * null   → no further pages available.
  * string → pass to the next getMyProjects() call for the next page.
- *
- * NOTE: The current backend signature accepts no cursor parameter.
- * This state is maintained for forward-compatibility when the service
- * layer is upgraded (SC-02).
  */
 let _nextCursor = null;
 
@@ -187,8 +200,8 @@ async function loadInitialDashboard() {
 
         // ── Repeater ─────────────────────────────────────────────────────
         if (projectRes.ok) {
-            _projects   = projectRes.data        || [];
-            _nextCursor = projectRes.nextCursor  || null;
+            _projects   = projectRes.data       || [];
+            _nextCursor = projectRes.nextCursor || null;
             renderProjectList(_projects);
             updateLoadMoreButton();
         } else {
@@ -211,8 +224,7 @@ async function loadInitialDashboard() {
  * Called by the #btnLoadMore onClick handler.
  *
  * Only fires when _nextCursor is non-null (enforced by updateLoadMoreButton).
- * The cursor argument is passed for forward-compatibility; the current
- * backend ignores unknown parameters and returns the full list.
+ * The cursor is an opaque string from the backend — passed back unchanged.
  */
 async function loadMoreProjects() {
     if (_isLoading || !_nextCursor) return;
@@ -319,10 +331,10 @@ async function openProjectModal() {
 
 export function debugPageState() {
     return {
-        version:     '2.1.0',
+        version:      '2.2.0',
         projectCount: _projects.length,
-        nextCursor:  _nextCursor,
-        isLoading:   _isLoading,
-        timestamp:   new Date().toISOString()
+        nextCursor:   _nextCursor,
+        isLoading:    _isLoading,
+        timestamp:    new Date().toISOString()
     };
 }

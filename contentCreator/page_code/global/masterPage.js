@@ -1,7 +1,25 @@
 /**
+ * [ FILE NAME : masterPage.js : v.1.7.0 ]
  * Page Code: Master Page (Global)
  * Path: /page_code/global/masterPage.js
- * Version: [ MASTER PAGE : v.1.6.0 ]
+ * Version: [ MASTER PAGE : v.1.7.0 ]
+ *
+ * Changelog v.1.6.0 → v.1.7.0
+ * ─────────────────────────────────────────────────────────────────────────────
+ * [CR-01 / UTIL-03] Removed local _safeDisable() — replaced with
+ * safeDisable() / safeEnable() from public/utils/ui.
+ *
+ *   The local _safeDisable(selector, disabled) helper merged disable and
+ *   enable into one function with a boolean flag. ui.js exports these as two
+ *   separate, CR-01-compliant primitives: safeDisable(selector) and
+ *   safeEnable(selector). Both are called explicitly at the two call sites
+ *   in _handleLogOut() in place of the removed helper.
+ *
+ *   NOTE: ui.js is a /public/ module. Public modules are importable from
+ *   masterPage.js in Wix Velo — they resolve in the Master Page's runtime
+ *   scope and $w() calls inside them resolve against the Master Page canvas,
+ *   which is the correct behaviour for #btnLogOut.
+ * ─────────────────────────────────────────────────────────────────────────────
  *
  * v.1.6.0 — Revert postMessage / onMessage approach
  * ───────────────────────────────────────────────────
@@ -35,8 +53,10 @@
 
 import wixLocation        from 'wix-location';
 import { authentication } from 'wix-members';
+// [CR-01 / UTIL-03] Canonical UI primitives — replaces local _safeDisable()
+import { safeDisable, safeEnable } from 'public/utils/ui';
 
-const VERSION             = '[ MASTER PAGE : v.1.6.0 ]';
+const VERSION             = '[ MASTER PAGE : v.1.7.0 ]';
 const MSG_ERROR_GENERIC   = 'Technical error encountered. Please try again later.';
 const PATH_HOME           = 'https://www.adbyrd.com/cc';
 const TOASTER_DURATION_MS = 4000;
@@ -83,7 +103,8 @@ function _showToaster(message, type = 'error') {
 // ─── LOGOUT ───────────────────────────────────────────────────────────────────
 
 async function _handleLogOut() {
-    _safeDisable('#btnLogOut', true);
+    // [CR-01 / UTIL-03] was: _safeDisable('#btnLogOut', true)
+    safeDisable('#btnLogOut');
     console.log(`${VERSION} Logout initiated.`);
 
     try {
@@ -92,18 +113,8 @@ async function _handleLogOut() {
         wixLocation.to(PATH_HOME);
     } catch (err) {
         console.error(`${VERSION} Logout failed:`, err);
-        _safeDisable('#btnLogOut', false);
+        // [CR-01 / UTIL-03] was: _safeDisable('#btnLogOut', false)
+        safeEnable('#btnLogOut');
         _showToaster(MSG_ERROR_GENERIC, 'error');
-    }
-}
-
-// ─── SAFE UI HELPERS ──────────────────────────────────────────────────────────
-
-function _safeDisable(selector, disabled = true) {
-    const el = $w(selector);
-    if (el && typeof el.disable === 'function') {
-        disabled ? el.disable() : el.enable();
-    } else {
-        console.warn(`${VERSION} _safeDisable: Element ${selector} not found.`);
     }
 }
