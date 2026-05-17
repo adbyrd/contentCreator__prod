@@ -1,36 +1,65 @@
 /**
+ * [ FILE NAME : notification.js : v.2.3.0 ]
  * Utility: Notifications & User Feedback
  * Path: /public/utils/notification.js
- * Version: [ NOTIFICATIONS : v.2.2.0 ]
+ * Version: [ NOTIFICATIONS : v.2.3.0 ]
  *
- * v.2.2.0 — postMessage Toaster Bridge
- * ──────────────────────────────────────
- * PROBLEM: Both the direct $w('#globalToaster') approach (v.2.0.0) and the
- * exported function approach (v.2.1.0 / triggerGlobalToaster) produce
- * "#globalToaster not found" because Velo always binds $w() to the calling
- * module's runtime scope, not where the function was defined. Exporting a
- * function from masterPage.js does not transfer its $w scope to callers.
+ * Changelog v.2.2.0 → v.2.3.0
+ * ─────────────────────────────────────────────────────────────────────────────
+ * [FIX-TOAST-02] postMessage approach replaced — page-local toaster pattern
  *
- * SOLUTION: Use wixWindow.postMessage() to send a structured message to the
- * Master Page. masterPage.js listens via wixWindow.onMessage() and calls its
- * own _showToaster() which runs entirely in the Master Page scope, where
- * $w('#globalToaster') resolves correctly.
+ *   PROBLEM (v.2.2.0 — postMessage bridge):
+ *     wixWindow.postMessage() sends to the Master Page. masterPage.js v.1.6.0
+ *     intentionally removed wixWindow.onMessage() because it is a lightbox-only
+ *     API — calling it on the Master Page throws:
+ *       TypeError: i(...).onMessage is not a function
+ *     This means postMessage is dispatched but never received. Every showToaster()
+ *     call silently dropped the message, producing:
+ *       "[ NOTIFICATIONS : v.2.3.0 ] showToaster: #globalToaster not found on
+ *        this page."
  *
- * Message contract:
- *   { channel: 'SHOW_TOASTER', message: string, type: 'success' | 'error' }
+ *   PROBLEM (v.2.0.0 — direct $w('#globalToaster') on Master Page):
+ *     Velo always binds $w() to the calling module's runtime scope — not to
+ *     where the element is defined. A public utility calling $w('#globalToaster')
+ *     resolves against the current page canvas, not the Master Page canvas.
  *
- * This is the only Velo-supported mechanism for cross-scope Master Page
- * DOM operations from page code or public utilities.
+ *   PROBLEM (Editor — duplicate ID constraint):
+ *     Wix enforces globally unique element IDs across ALL canvases on a page,
+ *     including the Master Page. Attempting to add #globalToaster to an
+ *     individual page canvas while #globalToaster exists on the Master Page
+ *     canvas produces the error: "The ID has to be unique."
  *
- * All existing showToaster() call sites are unchanged — the public API is
- * backward compatible. No other files require modification.
+ *   SOLUTION — Page-local toaster with a unique ID:
+ *     Each page canvas that needs toast notifications must have a collapsible
+ *     container element with ID #pageToaster and a child text element with ID
+ *     #pageToasterMsg. These IDs do not conflict with the Master Page's
+ *     #globalToaster / #toasterMsg elements.
  *
- * showInlineError() and clearInlineError() are unchanged — they operate on
- * page-local elements where page-scoped $w() is correct.
+ *     showToaster() calls $w('#pageToaster') directly. Because this is a public
+ *     utility called from page code, $w() resolves to the current page canvas —
+ *     exactly where #pageToaster lives. No postMessage, no cross-scope call.
  *
- * Canvas requirements:
- *   Master Page : #globalToaster, #toasterMsg  (managed by masterPage.js)
- *   Page-local  : per-selector inline error elements (managed by callers)
+ *     The Master Page retains its own #globalToaster / #toasterMsg exclusively
+ *     for Master Page-level events (e.g. logout failure via masterPage.js).
+ *     These two element sets never conflict.
+ *
+ *   CANVAS REQUIREMENTS — add to EACH page that calls showToaster():
+ *     #pageToaster    — collapsible container (hidden/collapsed on load)
+ *     #pageToasterMsg — Text element inside #pageToaster
+ *
+ *   Pages currently calling showToaster():
+ *     /projects (Project Explorer)    → add #pageToaster + #pageToasterMsg
+ *     /project/{id} (Project Detail)  → add #pageToaster + #pageToasterMsg
+ *     settings modals (lightboxes)    → add #pageToaster + #pageToasterMsg
+ *     masterPage.js                   → uses its own #globalToaster (no change)
+ *
+ *   All showToaster() call sites across the application are unchanged —
+ *   the public API is fully backward compatible.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * v.2.2.0 — postMessage Toaster Bridge (superseded)
+ * v.2.0.0 — Direct $w('#globalToaster') approach (superseded)
+ * ─────────────────────────────────────────────────────────────────────────────
  *
  * Exports:
  *   showToaster(message, type)
@@ -39,10 +68,17 @@
  *   debugNotifications()
  */
 
-import wixWindow from 'wix-window';
+const VERSION            = '[ NOTIFICATIONS : v.2.3.0 ]';
+const TOASTER_DURATION_MS = 4000;
 
-const VERSION            = '[ NOTIFICATIONS : v.2.2.0 ]';
-const TOASTER_CHANNEL    = 'SHOW_TOASTER';
+// Page-local toaster element IDs.
+// Must exist on every page canvas that calls showToaster().
+// Do NOT use #globalToaster — that ID is reserved for the Master Page canvas.
+const SEL_TOASTER     = '#pageToaster';
+const SEL_TOASTER_MSG = '#pageToasterMsg';
+
+// Default duration for inline field errors (ms).
+const INLINE_ERROR_DURATION_MS = 6000;
 
 // ─── SHARED CONSTANTS ─────────────────────────────────────────────────────────
 
@@ -50,29 +86,48 @@ export const MSG_GENERIC_ERROR  = 'Something went wrong. Please try again or con
 export const MSG_UPDATE_SUCCESS = 'Settings updated successfully.';
 export const MSG_SAVE_FAILED    = 'Unable to save. Please try again.';
 
-// Default duration for inline field errors (ms).
-const INLINE_ERROR_DURATION_MS = 6000;
-
 // ─── GLOBAL TOASTER ───────────────────────────────────────────────────────────
 
 /**
- * Displays the site-wide feedback bar on the Master Page.
+ * Displays the page-local feedback toaster.
  *
- * Sends a postMessage to the Master Page, which runs _showToaster() in its
- * own scope where $w('#globalToaster') resolves correctly.
+ * Requires #pageToaster (collapsible container) and #pageToasterMsg (text
+ * element) to be present on the current page canvas. Both must be set to
+ * "Collapsed on load" in the Wix Editor.
  *
- * Safe to call from page controllers, modals, and utilities on any page.
+ * If either element is absent (e.g. during development or on a page not yet
+ * configured), the message is logged as a warning but does not throw.
  *
  * @param {string} message
  * @param {'success'|'error'} [type='success']
  */
 export function showToaster(message, type = 'success') {
     try {
-        wixWindow.postMessage({ channel: TOASTER_CHANNEL, message, type });
-        console.log(`${VERSION} [${type.toUpperCase()}] showToaster dispatched: "${message}"`);
+        const $toaster = $w(SEL_TOASTER);
+        const $msg     = $w(SEL_TOASTER_MSG);
+
+        if (typeof $toaster?.expand !== 'function') {
+            console.warn(`${VERSION} showToaster: ${SEL_TOASTER} not found on this page. Message: "${message}"`);
+            return;
+        }
+
+        $msg.text = message;
+
+        if ($toaster.style) {
+            $toaster.style.backgroundColor = (type === 'success') ? '#7bef8593' : '#FFEBEE';
+        }
+
+        $toaster.expand()
+            .then(() => setTimeout(() => {
+                if (typeof $toaster.collapse === 'function') $toaster.collapse();
+            }, TOASTER_DURATION_MS))
+            .catch(err => console.warn(`${VERSION} showToaster expand/collapse error:`, err));
+
+        console.log(`${VERSION} [${type.toUpperCase()}] showToaster: "${message}"`);
+
     } catch (err) {
-        // postMessage failure must never interrupt the calling flow.
-        console.warn(`${VERSION} showToaster: postMessage failed. Message was: "${message}"`, err);
+        // showToaster must never interrupt the calling flow.
+        console.warn(`${VERSION} showToaster: unexpected error. Message was: "${message}"`, err);
     }
 }
 
@@ -80,11 +135,7 @@ export function showToaster(message, type = 'success') {
 
 /**
  * Expands a collapsible error element on the current page and auto-collapses
- * it after a timeout.
- *
- * These elements are page-local — $w() is correctly page-scoped here.
- * Falls back to showToaster() if the element is not present so the message
- * is never silently dropped.
+ * it after a timeout. Falls back to showToaster() if the element is absent.
  *
  * @param {string} selector    - e.g. '#newProjectError'
  * @param {string} message
@@ -111,7 +162,6 @@ export function showInlineError(selector, message, timeoutMs = INLINE_ERROR_DURA
 
 /**
  * Collapses an inline error element immediately.
- * Call when validation passes to clear a previous error without waiting.
  *
  * @param {string} selector
  */
@@ -122,7 +172,6 @@ export function clearInlineError(selector) {
 
 // ─── DEBUG ────────────────────────────────────────────────────────────────────
 
-/** Smoke-tests the toaster. Call from the browser console or API Explorer. */
 export function debugNotifications() {
     console.log(`${VERSION} Debug: firing test toaster...`);
     showToaster('Notification system operational.', 'success');
