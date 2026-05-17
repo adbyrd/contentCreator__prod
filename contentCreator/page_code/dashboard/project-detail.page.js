@@ -1,70 +1,62 @@
 /**
- * [ FILE NAME : project-detail.page__v2.8.0 ]
+ * [ FILE NAME : project-detail.page__v2.9.0 ]
  * Page: Project Detail (Dynamic)
  * Path: /page_code/dashboard/project-detail.page.js
- * Version: [ PROJECT DETAIL : v2.8.0 ]
+ * Version: [ PROJECT DETAIL : v2.9.0 ]
  *
- * Changelog v2.7.0 → v2.8.0
+ * Changelog v2.8.0 → v2.9.0
+ * ─────────────────────────────────────────────────────────────────────────────
+ * [BUG-04] wireCancelButton — _currentProject.storyboardStatus not updated
+ *          after successful cancel
+ *
+ *   ROOT CAUSE:
+ *     After a confirmed cancel, wireCancelButton() calls stopActivePoller()
+ *     and resetGenerationUI() but does NOT update the in-memory
+ *     _currentProject.storyboardStatus value. It remains 'generating'.
+ *
+ *     If the user immediately clicks Generate Storyboard again (without
+ *     refreshing), two things happen:
+ *
+ *       1. validateProjectForGeneration(_currentProject) passes — the fields
+ *          are intact in memory (they haven't been wiped yet at this point
+ *          because BUG-03 only wipes on the NEXT stamp write).
+ *
+ *       2. generateStoryboard() dispatches to the backend. The backend reads
+ *          the DB: storyboardStatus is 'cancelled' (not 'generating'), so
+ *          the ALREADY_RUNNING guard does NOT fire. The backend proceeds to
+ *          stamp the project as 'generating' using the partial-patch pattern
+ *          (BUG-03 in generateStoryboard.web.js v1.7.0), which wipes all
+ *          content fields (title, description, goal, offer, misconception,
+ *          target_audience) from the database.
+ *
+ *       3. The webhook dispatches successfully, but the database record is
+ *          now corrupt. On the next page refresh, the dynamic dataset loads
+ *          the corrupt record, _currentProject has all content fields null,
+ *          and validateProjectForGeneration() fails with '"Project name" is
+ *          required before generating a storyboard.'
+ *
+ *   NOTE: BUG-03 (the partial stamp in generateStoryboard.web.js) is the
+ *   primary data-loss vector. BUG-04 is the UX trigger that sends a second
+ *   generate call immediately after cancel, enabling BUG-03 to fire again
+ *   on the same session without a page reload. Both bugs must be fixed
+ *   together for complete resolution.
+ *
+ *   FIX:
+ *     After cancelStoryboard() returns ok, update _currentProject.storyboardStatus
+ *     to STATUS_CANCELLED in memory before calling resetGenerationUI().
+ *     This ensures that any immediate re-click of Generate Storyboard enters
+ *     a clean state — the backend's ALREADY_RUNNING guard cannot be bypassed
+ *     and the UI reflects the true status even before a refresh.
+ *
+ *     The fix is a single line added in wireCancelButton():
+ *       _currentProject = { ..._currentProject, storyboardStatus: STATUS_CANCELLED };
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Changelog v2.7.0 → v2.8.0 — preserved for history
  * ─────────────────────────────────────────────────────────────────────────────
  * [FIX-TOAST-01] 'warning' toaster type replaced with 'success'
- *
- *   ERROR:  Argument of type '"warning"' is not assignable to parameter
- *           of type '"success" | "error"'.
- *
- *   showToaster() in notification.js v.2.2.0 accepts only 'success' | 'error'.
- *   The MSG_CANCELLED call in wireCancelButton() passed 'warning', which is
- *   not in the type contract. Changed to 'success' — cancellation is a
- *   deliberate user action with a positive outcome, not an error condition.
- *
  * [FIX-SETUP-01] Removed setupPageUI() and its call site
- *
- *   setupPageUI() set #txtBreadcrumb.text and wired #btnBack. Both of these
- *   are handled directly by the Wix canvas (dataset binding for breadcrumb,
- *   Editor link for back button) and do not require page code. Removed the
- *   function and its call from $w.onReady to eliminate the dependency on
- *   these two canvas element IDs.
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Changelog v2.6.1 → v2.7.0
- * ─────────────────────────────────────────────────────────────────────────────
- * [FIX-IMPORT-02] Removed dead safeDisable import
- *
- *   safeDisable was imported from 'public/utils/ui' but was never called
- *   anywhere in this file. Removed from the import statement.
- *
- * [FIX-TODO-01] Implemented renderFrame() — storyboard frame repeater wiring
- *
- *   renderFrame() was a stub containing only a console.log and a TODO comment.
- *   Frames were fetched and acknowledged by the poller but never displayed.
- *
- *   Implementation:
- *     The in-memory _frames array accumulates all frames delivered so far,
- *     keyed by frameIndex to prevent duplicates on resume. On each new frame
- *     arrival, the full accumulated array is assigned to #storyboardRepeater.data
- *     (Wix diffs the array and only re-renders changed items). The repeater's
- *     onItemReady handler populates #frameImage, #frameNumber, #framePrompt,
- *     and #frameNarrativeStage per item.
- *
- *     clearStoryboardUI() empties the accumulator and clears the repeater
- *     before each new generation run, preventing stale frame bleed-through
- *     per the acceptance criteria in storyboardingfeature.pdf Section 4.5.
- *
- *   Canvas element requirements (Wix Editor — must match exactly):
- *   ┌─────────────────────────────────────────────────────────────────────┐
- *   │  #storyboardRepeater      — Repeater containing all frame items     │
- *   │    └─ #frameImage         — Image: frame.imageUrl                   │
- *   │    └─ #frameNumber        — Text:  "Frame N / 15"                   │
- *   │    └─ #framePrompt        — Text:  frame.promptText                 │
- *   │    └─ #frameNarrativeStage — Text: frame.frameData.narrativeStage   │
- *   │  #storyboardEmptyState    — Container: shown when no frames yet     │
- *   │  #storyboardCompleteState — Container: shown on generation complete │
- *   └─────────────────────────────────────────────────────────────────────┘
- *   All other canvas elements remain unchanged from v2.6.1.
- *
- * [FIX-VER-01] debugPageState() version string corrected
- *
- *   debugPageState() reported version '2.6.0' while the file header declared
- *   v2.6.1. Updated to '2.7.0' to match this version.
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * Canvas element requirements (full list)
@@ -96,7 +88,7 @@ import { safeShow, safeHide, setButtonLoading }            from 'public/utils/ui
 import { showToaster }                                     from 'public/utils/notification';
 import { startStoryboardPolling, stopStoryboardPolling }   from 'public/utils/storyboard-poller';
 
-const VERSION           = '[ PROJECT DETAIL : v2.8.0 ]';
+const VERSION           = '[ PROJECT DETAIL : v2.9.0 ]';
 const PATH_UNAUTHORIZED = '/cc';
 
 // ─── MESSAGES ─────────────────────────────────────────────────────────────────
@@ -124,6 +116,7 @@ const COMPLETE_STATE       = '#storyboardCompleteState';
 // ─── STATUS CONSTANTS ─────────────────────────────────────────────────────────
 
 const STATUS_GENERATING = 'generating';
+const STATUS_CANCELLED  = 'cancelled';
 const TOTAL_FRAMES      = 15;
 
 // ─── MODULE STATE ─────────────────────────────────────────────────────────────
@@ -278,6 +271,8 @@ function wireGenerateButton() {
         const result = await generateStoryboard(_currentProject._id);
 
         if (result.ok) {
+            // ── Sync in-memory status to match what the backend just stamped ──
+            _currentProject = { ..._currentProject, storyboardStatus: STATUS_GENERATING };
             safeHide(BTN_GENERATE);
             safeShow(BTN_CANCEL);
             console.log(`${VERSION} Generation dispatched. Cancel button shown.`);
@@ -290,6 +285,7 @@ function wireGenerateButton() {
 
         if (errorType === 'ALREADY_RUNNING') {
             console.log(`${VERSION} ALREADY_RUNNING — resuming active generation poll.`);
+            _currentProject = { ..._currentProject, storyboardStatus: STATUS_GENERATING };
             safeHide(BTN_GENERATE);
             safeShow(BTN_CANCEL);
             showToaster(MSG_ALREADY_RUNNING, 'success');
@@ -324,8 +320,8 @@ function wireGenerateButton() {
  *   2. On "Yes I'm Sure": call cancelStoryboard() backend method FIRST.
  *      This stamps storyboardStatus = 'cancelled' in the database so that
  *      a subsequent page refresh does not auto-resume the poller.
- *   3. Only if the backend stamp succeeds: stop the local poller and
- *      reset the UI to idle.
+ *   3. Only if the backend stamp succeeds: stop the local poller, sync
+ *      _currentProject in memory (BUG-04 fix), and reset the UI to idle.
  *   4. If the backend stamp fails: show an error toaster. The modal has
  *      already closed, so we leave the poller running and the cancel
  *      button visible — generation continues and the user can retry.
@@ -356,6 +352,17 @@ function wireCancelButton() {
                 showToaster(MSG_CANCEL_FAILED, 'error');
                 return;
             }
+
+            // ── [BUG-04] FIX: sync in-memory status before resetting UI ───────
+            // Without this, _currentProject.storyboardStatus stays 'generating'
+            // in memory. A subsequent Generate click would pass front-end
+            // validation and dispatch a second backend call in the same session,
+            // enabling the partial-stamp data-loss bug (BUG-03) to fire again.
+            //
+            // Spread to produce a new object reference — prevents accidental
+            // mutation of the original record shape.
+            _currentProject = { ..._currentProject, storyboardStatus: STATUS_CANCELLED };
+            console.log(`${VERSION} _currentProject.storyboardStatus synced to '${STATUS_CANCELLED}'`);
 
             // ── Backend confirmed — now safe to stop frontend poller ───────────
             console.log(`${VERSION} Database stamped. Stopping poller and resetting UI.`);
@@ -444,22 +451,6 @@ function registerFrameRepeaterItemReady() {
  * Renders a newly delivered storyboard frame into the page UI.
  *
  * Called by the poller's onFrame callback on every new frame arrival.
- *
- * Strategy — Map-based accumulator + full repeater assignment:
- *   1. The incoming frame is stored in _frameMap keyed by frameIndex.
- *      Map prevents duplicates if the poller delivers the same frame twice
- *      (e.g. after a resume — the poller re-delivers all seen frames from
- *      its seenFrameIds set, so _frameMap acts as the dedup layer here).
- *   2. The full accumulator is converted to a sorted array and assigned to
- *      #storyboardRepeater.data. Wix diffs the array and only re-renders
- *      items whose _id has changed, so this is efficient even at 15 frames.
- *   3. #storyboardEmptyState is hidden on the first frame arrival.
- *
- * Progressive reveal: each individual frame appears on screen immediately
- * when its onFrame callback fires, without waiting for all 15.
- *
- * @param {object} frame  — individual frame record from the poller
- * @param {array}  frames — all frames delivered so far (ascending frameIndex)
  */
 function renderFrame(frame, frames) {
     console.log(`${VERSION} Frame received: index ${frame.frameIndex} | total so far: ${frames.length}`);
@@ -487,8 +478,6 @@ function renderFrame(frame, frames) {
 /**
  * Called by the poller's onComplete callback when all 15 frames are confirmed.
  * Shows the completion banner and resets the generation UI controls.
- *
- * @param {array} frames — the full 15-frame array
  */
 function onGenerationComplete(frames) {
     console.log(`${VERSION} onGenerationComplete — showing complete state banner.`);
@@ -500,7 +489,6 @@ function onGenerationComplete(frames) {
 /**
  * Clears the frame accumulator and empties the repeater.
  * Called before each new generation run to prevent stale frame bleed-through.
- * Per acceptance criteria: storyboardingfeature.pdf Section 4.5.
  */
 function clearStoryboardUI() {
     _frameMap.clear();
@@ -548,7 +536,7 @@ export function debugPageState() {
     console.log(`${VERSION} _activePoller:`,   _activePoller);
     console.log(`${VERSION} _frameMap size:`,  _frameMap.size);
     return {
-        version:          '2.8.0',       // [FIX-VER-01] was: '2.6.0'
+        version:          '2.9.0',
         projectId:        _currentProject?._id               || null,
         projectTitle:     _currentProject?.title             || null,
         storyboardStatus: _currentProject?.storyboardStatus  || null,

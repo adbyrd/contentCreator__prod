@@ -1,37 +1,88 @@
-// [ FILE NAME : generateStoryboard.web.js : v1.7.0 ]
+// [ FILE NAME : generateStoryboard.web.js : v1.8.0 ]
 // Domain  : Storyboard
 // Layer   : Backend — Dispatch Gate + Cancel
 // Path    : /backend/storyboard/generateStoryboard.web.js
 // ──────────────────────────────────────────────────────────────────────────────
-// Changelog v1.6.0 → v1.7.0
+// Changelog v1.7.0 → v1.8.0
+//
+// [BUG-03] generateStoryboard — status stamp wipes all project fields
+//
+//   ROOT CAUSE:
+//     The generateStoryboard status stamp at line 329 used a targeted patch:
+//       { _id, storyboardStatus, storyboardFrameCount, storyboardStartedAt,
+//         storyboardCompletedAt }
+//     wixData.update() with suppressAuth replaces the ENTIRE document. A
+//     partial object wipes every field not included in the payload — title,
+//     description, goal, offer, misconception, target_audience, etc. are all
+//     set to null/undefined in the database.
+//
+//     This is the SAME class of bug as [BUG-02] (cancelStoryboard v1.5.0),
+//     which was fixed in v1.6.0. The same fix must be applied here.
+//
+//   IMPACT:
+//     After a successful generation dispatch, all project content fields are
+//     destroyed in the database. On page refresh the dynamic dataset renders
+//     empty fields. The _currentProject cached on the frontend still holds the
+//     original values (hence fields appear intact during the same session), but
+//     validateProjectForGeneration() reads from _currentProject, so the "title
+//     is required" message only appears AFTER a refresh — exactly matching the
+//     QA reproduction steps.
+//
+//   FIX:
+//     Spread the full `project` record (already fetched above in the function)
+//     into the update payload, then overlay only the storyboard status fields.
+//     No additional DB read is required — `project` is already in scope.
+//
+//       { ...project, storyboardStatus, storyboardFrameCount, ... }
+//
+// [BUG-04] generateStoryboard — _currentProject not refreshed after cancel
+//
+//   ROOT CAUSE:
+//     After a successful cancel, wireCancelButton() calls resetGenerationUI()
+//     but does NOT update _currentProject.storyboardStatus in memory. The
+//     in-memory value remains 'generating'. When the user immediately clicks
+//     Generate again (without refreshing), validateProjectForGeneration() passes
+//     (fields are present in memory), generateStoryboard() is called, and the
+//     backend's ALREADY_RUNNING guard fires because the database still reads
+//     'cancelled' (correctly) but the frontend dispatches a second call before
+//     the backend can confirm 'cancelled'. Actually the guard reads the DB at
+//     call time, so the DB says 'cancelled', which is NOT 'generating', so
+//     ALREADY_RUNNING does NOT fire. Instead the storyboard status is stamped
+//     back to 'generating' via the partial patch — which again wipes all fields
+//     (BUG-03). The generate call SUCCEEDS from the backend's perspective and
+//     dispatches a webhook, but the frontend sees the 'GENERATION_FAILED' error
+//     message because the backend returned ok:true — wait, let's be precise:
+//
+//     ACTUAL reproduction:
+//       After cancel, DB status = 'cancelled'. User clicks Generate.
+//       Backend: storyboardStatus !== 'generating', so ALREADY_RUNNING guard
+//       does NOT block. The status stamp update (BUG-03 partial patch) runs and
+//       wipes all fields. Webhook dispatches. But the webhook itself may fail
+//       (n8n may reject a second dispatch for the same project, or the toaster
+//       fires for another reason). The frontend shows MSG_GENERATION_FAILED.
+//
+//       On refresh: all fields are gone (wiped by the partial stamp). The
+//       dynamic dataset now shows empty. _currentProject is re-fetched from the
+//       DB and fields are null, so validateProjectForGeneration() fails with
+//       '"Project name" is required'.
+//
+//   FIX:
+//     After a confirmed cancel, update _currentProject.storyboardStatus in
+//     memory to 'cancelled'. This is done in wireCancelButton() in
+//     project-detail.page.js v2.9.0 (see companion fix).
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Changelog v1.6.0 → v1.7.0 — preserved for history
 //
 // [FIX-SIGNAL-01] postWithRetry — AbortController/signal removed
 //
 //   ERROR:  Object literal may only specify known properties, and 'signal'
 //           does not exist in type 'WixFetchRequest'.
 //
-//   ROOT CAUSE:
-//     wix-fetch is Wix's server-side fetch implementation. Its WixFetchRequest
-//     type does not include 'signal' — AbortController is a browser/Node API
-//     that Wix has not exposed in the Velo fetch surface.
-//
 //   FIX:
-//     AbortController and the signal field are removed from the fetch call.
-//     Timeout is now implemented via Promise.race() between the fetch promise
-//     and a manually constructed rejection promise that rejects after
-//     WEBHOOK_TIMEOUT_MS milliseconds. This is the Velo-compatible pattern
-//     for enforcing per-request timeouts without AbortController:
-//
-//       const timeoutPromise = new Promise((_, reject) =>
-//         setTimeout(() => reject(new Error('TIMEOUT')), WEBHOOK_TIMEOUT_MS)
-//       );
-//       const response = await Promise.race([fetch(...), timeoutPromise]);
-//
-//     The timeout timer is cleared in a finally block on all code paths so
-//     it does not hold the Node process alive after the request resolves.
-//     The catch block treats 'TIMEOUT' message the same as an AbortError
-//     was previously treated — recorded as lastError and retried up to
-//     MAX_RETRIES times.
+//     Timeout enforced via Promise.race() between the fetch promise and a
+//     manually constructed rejection promise. Velo-compatible pattern.
 //
 // ──────────────────────────────────────────────────────────────────────────────
 //
@@ -56,7 +107,7 @@ import { fetch }                  from 'wix-fetch';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const VERSION              = '[ GENERATE STORYBOARD : v1.7.0 ]';
+const VERSION              = '[ GENERATE STORYBOARD : v1.8.0 ]';
 const CANCEL_VERSION       = '[ CANCEL STORYBOARD : v1.3.0 ]';
 
 const COLLECTION_PROJECTS  = 'projects';
@@ -104,15 +155,19 @@ async function getMemberId() {
 
 /**
  * Best-effort status rollback to STATUS_FAILED.
- * Intentionally uses a targeted patch (not a full spread) — rollback is an
- * emergency write on a potentially partially-corrupt record. Writing only
- * storyboardStatus is safer than spreading unknown field state.
+ *
+ * Intentionally uses a FULL spread of the project record — rollback must not
+ * wipe fields. The project record is already in scope at every call site, so
+ * no additional DB read is required. We overlay only storyboardStatus.
  */
 async function rollbackStatus(project, requestId) {
   try {
     await wixData.update(
       COLLECTION_PROJECTS,
-      { _id: project._id, storyboardStatus: STATUS_FAILED },
+      {
+        ...project,
+        storyboardStatus: STATUS_FAILED,
+      },
       DB_OPTIONS
     );
     console.warn(`${VERSION} [${requestId}] Status rolled back to '${STATUS_FAILED}'`);
@@ -325,11 +380,19 @@ export const generateStoryboard = webMethod(
     console.log(`${VERSION} [${requestId}] Pre-dispatch validation passed — all required fields resolved`);
 
     const generationStartedAt = new Date().toISOString();
+
+    // ── [BUG-03] FIX: spread full project record, overlay storyboard fields ────
+    // wixData.update() replaces the entire document. A partial object (previous
+    // behaviour) wipes every field not explicitly included — title, description,
+    // goal, offer, misconception, target_audience, etc. all become null.
+    //
+    // Fix: spread `project` first (already fetched above), then overlay only
+    // the storyboard status fields. No additional DB read required.
     try {
       await wixData.update(
         COLLECTION_PROJECTS,
         {
-          _id:                   project._id,
+          ...project,
           storyboardStatus:      STATUS_GENERATING,
           storyboardFrameCount:  0,
           storyboardStartedAt:   generationStartedAt,
