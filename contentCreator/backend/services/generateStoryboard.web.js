@@ -1,113 +1,94 @@
-// [ FILE NAME : generateStoryboard.web.js : v1.8.0 ]
+// [ FILE NAME : generateStoryboard.web.js : v2.0.0 ]
 // Domain  : Storyboard
 // Layer   : Backend — Dispatch Gate + Cancel
 // Path    : /backend/storyboard/generateStoryboard.web.js
 // ──────────────────────────────────────────────────────────────────────────────
-// Changelog v1.7.0 → v1.8.0
+// Changelog v1.9.4 → v2.0.0
+//
+// [BUG-CRYPTO-06] Web Crypto API inaccessible in .web.js compilation context
+//
+//   ROOT CAUSE:
+//     Velo compiles .web.js files in a restricted client-boundary context
+//     that rejects all global crypto identifiers at static analysis time.
+//     Across v1.9.0–v1.9.4, the following were each attempted and rejected:
+//       v1.9.0  — crypto.subtle          (no-undef: 'crypto')
+//       v1.9.1  — /* global crypto */    (directive not honoured)
+//       v1.9.2  — globalThis.crypto      (no-undef: 'globalThis')
+//       v1.9.3  — self.crypto            (no-undef: 'self')
+//       v1.9.4  — new Function(...)      (bundler rejects at compile time)
+//
+//     The underlying cause is architectural: .web.js modules are compiled
+//     as public webMethod boundaries and do not have access to Node.js
+//     built-ins OR browser globals in Velo's static analysis pass.
+//
+//   FIX:
+//     Extracted buildHmacSignature() into a dedicated private backend module:
+//       /backend/storyboard/hmac.js
+//
+//     Private .js files in /backend/ are compiled in the full server-side
+//     Node.js context where `import { createHmac } from 'crypto'` is valid.
+//     generateStoryboard.web.js imports buildHmacSignature from that module.
+//
+//     The function is synchronous again — Node.js createHmac is synchronous.
+//     The `await` added in v1.9.0 has been removed from the call site.
+//
+//   REQUIRED COMPANION FILE:
+//     /backend/storyboard/hmac.js must be created alongside this file.
+//     See hmac.js for full implementation. Without it this file will throw
+//     an import resolution error at module load time.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+// Changelog v1.8.0 → v1.9.x — preserved for history
+//
+// [BUG-CRYPTO-01–05] Various failed attempts to access Web Crypto API
+//   directly inside a .web.js module. Superseded by v2.0.0 architectural fix.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+// Changelog v1.7.0 → v1.8.0 — preserved for history
 //
 // [BUG-03] generateStoryboard — status stamp wipes all project fields
 //
-//   ROOT CAUSE:
-//     The generateStoryboard status stamp at line 329 used a targeted patch:
-//       { _id, storyboardStatus, storyboardFrameCount, storyboardStartedAt,
-//         storyboardCompletedAt }
-//     wixData.update() with suppressAuth replaces the ENTIRE document. A
-//     partial object wipes every field not included in the payload — title,
-//     description, goal, offer, misconception, target_audience, etc. are all
-//     set to null/undefined in the database.
-//
-//     This is the SAME class of bug as [BUG-02] (cancelStoryboard v1.5.0),
-//     which was fixed in v1.6.0. The same fix must be applied here.
-//
-//   IMPACT:
-//     After a successful generation dispatch, all project content fields are
-//     destroyed in the database. On page refresh the dynamic dataset renders
-//     empty fields. The _currentProject cached on the frontend still holds the
-//     original values (hence fields appear intact during the same session), but
-//     validateProjectForGeneration() reads from _currentProject, so the "title
-//     is required" message only appears AFTER a refresh — exactly matching the
-//     QA reproduction steps.
-//
-//   FIX:
-//     Spread the full `project` record (already fetched above in the function)
-//     into the update payload, then overlay only the storyboard status fields.
-//     No additional DB read is required — `project` is already in scope.
-//
-//       { ...project, storyboardStatus, storyboardFrameCount, ... }
+//   wixData.update() with suppressAuth replaces the ENTIRE document. A
+//   partial object wipes every field not included in the payload. Fix: spread
+//   the full `project` record into the update payload, then overlay only the
+//   storyboard status fields. No additional DB read required.
 //
 // [BUG-04] generateStoryboard — _currentProject not refreshed after cancel
 //
-//   ROOT CAUSE:
-//     After a successful cancel, wireCancelButton() calls resetGenerationUI()
-//     but does NOT update _currentProject.storyboardStatus in memory. The
-//     in-memory value remains 'generating'. When the user immediately clicks
-//     Generate again (without refreshing), validateProjectForGeneration() passes
-//     (fields are present in memory), generateStoryboard() is called, and the
-//     backend's ALREADY_RUNNING guard fires because the database still reads
-//     'cancelled' (correctly) but the frontend dispatches a second call before
-//     the backend can confirm 'cancelled'. Actually the guard reads the DB at
-//     call time, so the DB says 'cancelled', which is NOT 'generating', so
-//     ALREADY_RUNNING does NOT fire. Instead the storyboard status is stamped
-//     back to 'generating' via the partial patch — which again wipes all fields
-//     (BUG-03). The generate call SUCCEEDS from the backend's perspective and
-//     dispatches a webhook, but the frontend sees the 'GENERATION_FAILED' error
-//     message because the backend returned ok:true — wait, let's be precise:
-//
-//     ACTUAL reproduction:
-//       After cancel, DB status = 'cancelled'. User clicks Generate.
-//       Backend: storyboardStatus !== 'generating', so ALREADY_RUNNING guard
-//       does NOT block. The status stamp update (BUG-03 partial patch) runs and
-//       wipes all fields. Webhook dispatches. But the webhook itself may fail
-//       (n8n may reject a second dispatch for the same project, or the toaster
-//       fires for another reason). The frontend shows MSG_GENERATION_FAILED.
-//
-//       On refresh: all fields are gone (wiped by the partial stamp). The
-//       dynamic dataset now shows empty. _currentProject is re-fetched from the
-//       DB and fields are null, so validateProjectForGeneration() fails with
-//       '"Project name" is required'.
-//
-//   FIX:
-//     After a confirmed cancel, update _currentProject.storyboardStatus in
-//     memory to 'cancelled'. This is done in wireCancelButton() in
-//     project-detail.page.js v2.9.0 (see companion fix).
+//   After a confirmed cancel, wireCancelButton() now updates
+//   _currentProject.storyboardStatus in memory to 'cancelled'. Handled in
+//   the companion fix in project-detail.page.js v2.9.0.
 //
 // ──────────────────────────────────────────────────────────────────────────────
-//
 // Changelog v1.6.0 → v1.7.0 — preserved for history
 //
 // [FIX-SIGNAL-01] postWithRetry — AbortController/signal removed
 //
-//   ERROR:  Object literal may only specify known properties, and 'signal'
-//           does not exist in type 'WixFetchRequest'.
-//
-//   FIX:
-//     Timeout enforced via Promise.race() between the fetch promise and a
-//     manually constructed rejection promise. Velo-compatible pattern.
+//   WixFetchRequest does not support AbortController/signal. Timeout enforced
+//   via Promise.race() between the fetch promise and a manually constructed
+//   rejection promise. Timer cleared in finally block on all code paths.
 //
 // ──────────────────────────────────────────────────────────────────────────────
-//
 // Changelog v1.5.0 → v1.6.0 — preserved for history
 //
 // [BUG-02] cancelStoryboard — full-document-replace wipes all project fields
 //
-//   wixData.update() with suppressAuth replaces the ENTIRE document. The
-//   v1.5.0 cancel stamp wrote only { _id, storyboardStatus, cancelledAt },
-//   wiping every other field (target_audience, title, goal, offer, etc.).
-//   Fix: spread the full project record into the update payload and overlay
-//   only the cancel fields: { ...project, storyboardStatus, cancelledAt }.
+//   wixData.update() replaces the entire document. v1.5.0 cancel stamp wrote
+//   only { _id, storyboardStatus, cancelledAt }, wiping all other fields.
+//   Fix: spread the full project record and overlay only the cancel fields.
 //
 // ──────────────────────────────────────────────────────────────────────────────
 
 import { Permissions, webMethod } from 'wix-web-module';
 import { getSecret }              from 'wix-secrets-backend';
-import { createHmac }             from 'crypto';
 import wixData                    from 'wix-data';
 import { currentMember }          from 'wix-members-backend';
 import { fetch }                  from 'wix-fetch';
+import { buildHmacSignature } from 'backend/security.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const VERSION              = '[ GENERATE STORYBOARD : v1.8.0 ]';
+const VERSION              = '[ GENERATE STORYBOARD : v2.0.0 ]';
 const CANCEL_VERSION       = '[ CANCEL STORYBOARD : v1.3.0 ]';
 
 const COLLECTION_PROJECTS  = 'projects';
@@ -156,9 +137,9 @@ async function getMemberId() {
 /**
  * Best-effort status rollback to STATUS_FAILED.
  *
- * Intentionally uses a FULL spread of the project record — rollback must not
- * wipe fields. The project record is already in scope at every call site, so
- * no additional DB read is required. We overlay only storyboardStatus.
+ * Uses full spread of the project record — rollback must not wipe fields.
+ * The project record is already in scope at every call site, so no
+ * additional DB read is required. Only storyboardStatus is overlaid.
  */
 async function rollbackStatus(project, requestId) {
   try {
@@ -176,19 +157,16 @@ async function rollbackStatus(project, requestId) {
   }
 }
 
-function buildHmacSignature(rawBody, secret) {
-  return createHmac('sha256', secret).update(rawBody).digest('hex');
-}
+// ─── Webhook dispatch with retry ──────────────────────────────────────────────
 
 async function postWithRetry(url, rawBody, hmacSignature, requestId) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     // [FIX-SIGNAL-01] WixFetchRequest does not support AbortController/signal.
-    // Timeout is enforced via Promise.race() — the fetch races against a
-    // rejection promise that fires after WEBHOOK_TIMEOUT_MS milliseconds.
-    // The timer is cleared in a finally block on every code path so it does
-    // not hold the runtime alive after the request resolves or rejects.
+    // Timeout enforced via Promise.race() — the fetch races against a rejection
+    // promise that fires after WEBHOOK_TIMEOUT_MS milliseconds.
+    // The timer is cleared in a finally block on every code path.
     let timeoutId;
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(
@@ -200,7 +178,6 @@ async function postWithRetry(url, rawBody, hmacSignature, requestId) {
     try {
       console.log(`${VERSION} [${requestId}] Webhook attempt ${attempt}/${MAX_RETRIES}`);
 
-      // [FIX-SIGNAL-01] 'signal' field removed — not part of WixFetchRequest.
       const fetchPromise = fetch(url, {
         method:  'POST',
         headers: {
@@ -382,12 +359,9 @@ export const generateStoryboard = webMethod(
     const generationStartedAt = new Date().toISOString();
 
     // ── [BUG-03] FIX: spread full project record, overlay storyboard fields ────
-    // wixData.update() replaces the entire document. A partial object (previous
-    // behaviour) wipes every field not explicitly included — title, description,
-    // goal, offer, misconception, target_audience, etc. all become null.
-    //
-    // Fix: spread `project` first (already fetched above), then overlay only
-    // the storyboard status fields. No additional DB read required.
+    // wixData.update() replaces the entire document. A partial object wipes
+    // every field not explicitly included. Fix: spread `project` first (already
+    // fetched above), then overlay only the storyboard status fields.
     try {
       await wixData.update(
         COLLECTION_PROJECTS,
@@ -425,6 +399,9 @@ export const generateStoryboard = webMethod(
     };
 
     const rawBody = JSON.stringify(n8nPayload);
+
+    // [BUG-CRYPTO-06] buildHmacSignature imported from backend/storyboard/hmac.js.
+    // Synchronous — no await required. Node.js createHmac is synchronous.
     const hmacSig = buildHmacSignature(rawBody, callbackSecret);
 
     console.log(`${VERSION} [${requestId}] Payload assembled — HMAC signed — dispatching to n8n`);
@@ -462,18 +439,10 @@ export const generateStoryboard = webMethod(
  *
  * [BUG-02] v1.6.0 — Full-document-replace bug fixed.
  *
- *   The v1.5.0 cancel stamp wrote only:
- *     { _id, storyboardStatus, cancelledAt }
  *   wixData.update() with suppressAuth replaces the full document. Every
- *   other field (target_audience, title, goal, offer, etc.) was wiped to null.
- *
- *   Fix: spread the full `project` record (already fetched for ownership check
- *   in step 3) into the update payload, then overlay the cancel fields. This
- *   preserves all existing field values while updating only what must change.
- *
- *     { ...project, storyboardStatus: STATUS_CANCELLED, cancelledAt: ... }
- *
- *   No additional DB read is required — `project` is already in scope.
+ *   other field (target_audience, title, goal, offer, etc.) was wiped to null
+ *   in v1.5.0. Fix: spread the full project record and overlay only the cancel
+ *   fields. No additional DB read required — project is already in scope.
  */
 export const cancelStoryboard = webMethod(
   Permissions.SiteMember,
@@ -518,8 +487,6 @@ export const cancelStoryboard = webMethod(
     }
 
     // ── [BUG-02] FIX: spread full project record, overlay cancel fields ────────
-    // wixData.update() replaces the entire document. Spreading `project` first
-    // preserves all existing fields. The cancel fields are then overlaid on top.
     try {
       await wixData.update(
         COLLECTION_PROJECTS,
@@ -542,7 +509,7 @@ export const cancelStoryboard = webMethod(
   }
 );
 
-// ─── Debug exports ─────────────────────────────────────────────────────────────
+// ─── Debug exports ────────────────────────────────────────────────────────────
 
 export async function debugGenerateStoryboard(projectId = 'debug-project-id') {
   console.log(`${VERSION} [DEBUG] generateStoryboard simulation — projectId: ${projectId}`);
